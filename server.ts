@@ -7,8 +7,11 @@ import dotenv from "dotenv";
 
 dotenv.config();
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+// Safe path resolution for both ESM (development) and CJS (production bundle)
+const __filename = typeof import.meta !== "undefined" && import.meta.url
+  ? fileURLToPath(import.meta.url)
+  : "";
+const __dirname = __filename ? path.dirname(__filename) : "";
 
 async function startServer() {
   const app = express();
@@ -190,6 +193,9 @@ Always focus on being genuinely useful and producing high-quality answers.`
     }
   });
 
+  // Serve the website download bundle from the repo root in all modes
+  app.use('/Websitedownload', express.static(path.join(process.cwd(), 'Websitedownload')));
+
   // Vite development middleware integration
   if (process.env.NODE_ENV !== "production") {
     const vite = await createViteServer({
@@ -199,11 +205,15 @@ Always focus on being genuinely useful and producing high-quality answers.`
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(process.cwd(), 'dist');
+    const publicPath = path.join(process.cwd(), 'public');
+
     app.use(express.static(distPath));
+    app.use(express.static(publicPath));
+
     app.get('*', (req, res) => {
-      // Find whether dev.html or index.html is available in the dist assets
-      const devHtmlExists = path.join(distPath, 'dev.html');
-      res.sendFile(devHtmlExists);
+      // Find whether index.html is available in the dist assets
+      const indexPath = path.join(distPath, 'index.html');
+      res.sendFile(indexPath);
     });
   }
 

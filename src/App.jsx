@@ -1,31 +1,103 @@
-import { useState, useEffect, useRef } from 'react';
-import { games as gamesData } from './data/games';
+import { lazy, Suspense, useDeferredValue, useState, useEffect, useRef, useMemo, useCallback } from 'react';
+import { motion, AnimatePresence } from 'motion/react';
+import { getApps, initializeApp } from 'firebase/app';
+import { getAuth, signInAnonymously } from 'firebase/auth';
+import { collection, getFirestore, limit, onSnapshot, orderBy, query } from 'firebase/firestore';
+import { PUBLIC_GAMES_BASE_URL } from './data/gameSource';
+import { gameRankings } from './data/gameRankings';
+import defaultThumbnail from './assets/images/defaultthumbnail.png';
+const GAMES_PER_PAGE = 36;
+const gameHtmlCache = new Map();
+const GAME_RUNTIME_SHIM = `<script>
+  function poki_init_raw() { return false; }
+  function poki_commercial_break_raw() {}
+  function poki_rewarded_break_raw() {}
+  function poki_script_closure_raw() {}
+  function poki_get_team_raw() { return ''; }
+  function poki_set_team_raw() {}
+  window.poki_init_raw = poki_init_raw;
+  window.poki_commercial_break_raw = poki_commercial_break_raw;
+  window.poki_rewarded_break_raw = poki_rewarded_break_raw;
+  window.poki_script_closure_raw = poki_script_closure_raw;
+  window.poki_get_team_raw = poki_get_team_raw;
+  window.poki_set_team_raw = poki_set_team_raw;
+</script>`;
 
-// Dynamically preprocess games to ensure they all possess a stable and unique ID for keys and bookmarking
-const games = gamesData.map((game, index) => {
-  if (!game.id) {
-    const slug = (game.title || '').replace(/[^a-zA-Z0-9]/g, '').toLowerCase();
-    return {
-      ...game,
-      id: `game-gen-${index}-${slug}`
-    };
+const prepareGameHtml = (html, baseUrl) => {
+  const hasBaseUrl = /<base(?:\s[^>]*)?>/i.test(html);
+  const baseTag = hasBaseUrl ? '' : `<base href="${baseUrl}">`;
+  const runtimeShim = GAME_RUNTIME_SHIM;
+  if (/<head(?:\s[^>]*)?>/i.test(html)) {
+    return html.replace(/<head(\s[^>]*)?>/i, (head) => `${head}${baseTag}${runtimeShim}`);
   }
-  return game;
+  return `${baseTag}${runtimeShim}${html}`;
+};
+
+const createGameLoadErrorDocument = (url) => ({
+  srcDoc: `<html><body style="margin:0;background:#080b12;color:#e5e7eb;font:16px sans-serif;display:grid;place-items:center;min-height:100vh;text-align:center"><main><h2>Portal could not be loaded</h2><p>The remote portal file did not respond.</p><a href="${url}" target="_blank" rel="noreferrer" style="color:#60a5fa">Open source piece</a></main></body></html>`
 });
-import { initialArticles, gameOptions, toneOptions, generateMockAIArticle } from './data/articles';
-import FlashcardsWorkspace from './components/FlashcardsWorkspace';
-import QuizWorkspace from './components/QuizWorkspace';
-import GrammarCheckerWorkspace from './components/GrammarCheckerWorkspace';
-import ChatWorkspace from './components/ChatWorkspace';
-import MoviesWorkspace from './components/MoviesWorkspace';
+
+const loadGameFrame = async (url, signal) => {
+  if (!url.startsWith(PUBLIC_GAMES_BASE_URL)) return { src: url };
+
+  const loadHtml = async (sourceUrl) => {
+    const response = await fetch(sourceUrl, { signal });
+    if (!response.ok) throw new Error(`Portal file request failed: ${response.status}`);
+    const html = await response.text();
+    const baseUrl = sourceUrl.slice(0, sourceUrl.lastIndexOf('/') + 1);
+    return prepareGameHtml(html, baseUrl);
+  };
+
+  try {
+    const srcDoc = await loadHtml(url);
+    return { srcDoc };
+  } catch (error) {
+    if (error.name === 'AbortError') throw error;
+
+    const filename = new URL(url).pathname.split('/').pop();
+    if (!filename) throw error;
+
+    const localUrl = `${window.location.origin}/${filename}`;
+    const srcDoc = await loadHtml(localUrl);
+    return { srcDoc };
+  }
+};
+import { initialArticles } from './data/articles';
+const FlashcardsWorkspace = lazy(() => import('./components/FlashcardsWorkspace'));
+const QuizWorkspace = lazy(() => import('./components/QuizWorkspace'));
+const NotesWorkspace = lazy(() => import('./components/NotesWorkspace'));
+const StudyTimer = lazy(() => import('./components/StudyTimer'));
+const AiChatWorkspace = lazy(() => import('./components/AiChatWorkspace'));
+import UserChat from './components/UserChat';
+const MoviesWorkspace = lazy(() => import('./components/MoviesWorkspace'));
+import InformationSection from './components/InformationSection';
+const firebaseConfig = {
+  projectId: 'ultra-framework-zw1xt',
+  appId: '1:435315435216:web:b8746108ed875a8d25e0d5',
+  apiKey: 'AIzaSyAu5Oe190oojQUnWPajnzfEF2lNoBrFafs',
+  authDomain: 'ultra-framework-zw1xt.firebaseapp.com',
+  storageBucket: 'ultra-framework-zw1xt.firebasestorage.app',
+  messagingSenderId: '435315435216',
+};
+const firebaseApp = getApps().length ? getApps()[0] : initializeApp(firebaseConfig);
+const lobbyAuth = getAuth(firebaseApp);
+const lobbyDb = getFirestore(firebaseApp, 'ai-studio-chat1-72af77fd-eebc-43fa-8925-e79796be2d79');
+
+function LobbyUnreadIndicator({ visible }) {
+  if (!visible) return null;
+  return <span className="absolute -top-1 -right-1 w-2.5 h-2.5 rounded-full bg-red-500 border-2 border-[var(--bg-secondary)] shadow-[0_0_6px_rgba(239,68,68,0.8)]" aria-label="New lobby message" />;
+}
 import { 
   School, 
   Search, 
-  Play, 
+  Play,
+  Info, 
   ExternalLink, 
   RotateCcw, 
   Maximize2, 
   Minimize2, 
+  Expand,
+  Shrink,
   Plus, 
   Minus, 
   Heart, 
@@ -46,6 +118,8 @@ import {
   FileText,
   ChevronLeft,
   ChevronRight,
+  ChevronDown,
+  ChevronUp,
   Lock,
   Unlock,
   LogOut,
@@ -53,12 +127,24 @@ import {
   Code,
   Share2,
   Download,
+  Upload,
+  Settings,
+  Bell,
   Check,
   X,
-  Shuffle,
   Cpu,
   Box,
-  Mail
+  Mail,
+  Shield,
+  AlertTriangle,
+  Eye,
+  EyeOff,
+  History,
+  Shuffle,
+  Timer,
+  Dices,
+  GripVertical,
+  Crown
 } from 'lucide-react';
 
 // Safe storage helper to prevent SecurityError crash in sandboxed iframes
@@ -76,10 +162,540 @@ const safeStorage = {
     } catch (e) {
       // Ignore security errors
     }
+  },
+  removeItem: (key) => {
+    try {
+      localStorage.removeItem(key);
+    } catch (e) {
+      // Ignore security errors
+    }
   }
 };
 
+const isLocalGame = (url) => {
+  return url && !url.startsWith('http://') && !url.startsWith('https://');
+};
+
+const getLocalGameDownloadUrl = (url) => {
+  if (!url) return '';
+  if (url.startsWith('http://') || url.startsWith('https://')) return url;
+  if (url.startsWith('/')) return `${window.location.origin}${url}`;
+  return `${window.location.origin}/${url}`;
+};
+
+const getDirectGmfilesUrl = (url) => {
+  if (!url) return '';
+  if (url.startsWith('http://') || url.startsWith('https://')) return url;
+  let cleanName = url.startsWith('/') ? url.slice(1) : url;
+  if (cleanName.toLowerCase().startsWith('gmfiles/')) {
+    cleanName = cleanName.slice(8);
+  }
+  return `https://urnperiodic.github.io/Gmfiles/${cleanName}`;
+};
+
+const getGamePathName = (url) => {
+  if (!url) return '';
+  const cleanedUrl = url.split('?')[0].split('#')[0];
+  const filename = cleanedUrl.split('/').pop() || cleanedUrl;
+  return filename.replace(/\.html?$/i, '');
+};
+
+const copyTextToClipboard = async (text) => {
+  if (!text) return;
+
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (error) {
+    console.error('Failed to copy text:', error);
+  }
+};
+
+const decoyOptions = [
+  { value: 'classroom', label: 'Classroom', labelLong: 'Google Classroom', icon: 'https://ssl.gstatic.com/classroom/favicon.png' },
+  { value: 'canva', label: 'Canva', labelLong: 'Canva | Visual Suite', icon: 'https://static.canva.com/domain-assets/canva/static/images/favicon-1.ico' },
+  { value: 'clever', label: 'Clever', labelLong: 'Clever Login', icon: 'https://www.google.com/s2/favicons?sz=64&domain=clever.com' },
+  { value: 'campus', label: 'Campus', labelLong: 'Infinite Campus', icon: 'https://jerseycitynj.infinitecampus.org/campus/favicon-32x32.png' },
+  { value: 'docs', label: 'Docs', labelLong: 'Google Docs', icon: 'https://ssl.gstatic.com/docs/documents/images/docs-favicon-2026-v2.ico' },
+  { value: 'gmail', label: 'Inbox', labelLong: 'Inbox - JCPS', icon: 'https://ssl.gstatic.com/ui/v1/icons/mail/images/favicon_gmail_2026_v2.ico' },
+  { value: 'duolingo', label: 'Lingo', labelLong: 'Duolingo', icon: 'https://www.google.com/s2/favicons?sz=64&domain=duolingo.com' },
+  { value: 'ixl', label: 'IXL', labelLong: 'IXL Learning', icon: 'https://www.google.com/s2/favicons?sz=64&domain=ixl.com' }
+];
+
+const EMULATED_PLATFORMS = [
+  'arcade', 'atari2600', 'atarilynx', 'bootleg', 'colecovision', 'dos',
+  'gba', 'genesis plus', 'jaguar', 'n64', 'nds', 'neo geo pocket', 'nes',
+  'pokemon', 'psx', 'segagg', 'segamd', 'segams', 'segasaturn', 'snes',
+  'virtualboy', 'wonderswan'
+];
+
+const EMULATED_SYSTEM_NAMES = {
+  arcade: 'Arcade',
+  atari2600: 'Atari 2600',
+  atarilynx: 'Atari Lynx',
+  bootleg: 'Bootleg / Famiclone',
+  colecovision: 'ColecoVision',
+  dos: 'MS-DOS',
+  gba: 'Game Boy Advance',
+  'genesis plus': 'Genesis Plus',
+  jaguar: 'Atari Jaguar',
+  n64: 'Nintendo 64',
+  nds: 'Nintendo DS',
+  'neo geo pocket': 'Neo Geo Pocket',
+  nes: 'NES',
+  pokemon: 'Pokémon (ROMs)',
+  psx: 'PlayStation 1 (PSX)',
+  segagg: 'Sega Game Gear',
+  segamd: 'Sega Genesis / MD',
+  segams: 'Sega Master System',
+  segasaturn: 'Sega Saturn',
+  snes: 'Super Nintendo (SNES)',
+  virtualboy: 'Virtual Boy',
+  wonderswan: 'WonderSwan'
+};
+
+function GoGuardianDecoyNotice({
+  mode,
+  onToggleMode,
+  onClose,
+  decoyType,
+  positionClass = "absolute top-full right-0 mt-2 w-48 sm:w-52"
+}) {
+  // Automatically dismiss the message after a few seconds (6s) and record that it was shown
+  useEffect(() => {
+    safeStorage.setItem('unblocked-goguardian-notice-shown', 'true');
+    const timer = setTimeout(() => {
+      onClose();
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [onClose]);
+
+  const handleClose = () => {
+    safeStorage.setItem('unblocked-goguardian-notice-shown', 'true');
+    onClose();
+  };
+
+  return (
+    <motion.div
+      initial={{ opacity: 0, y: -6, scale: 0.96 }}
+      animate={{ opacity: 1, y: 0, scale: 1 }}
+      exit={{ opacity: 0, y: -6, scale: 0.96 }}
+      transition={{ duration: 0.18, ease: "easeOut" }}
+      onClick={() => {
+        handleClose();
+        onToggleMode();
+      }}
+      className={`${positionClass} z-[99999] rounded-xl bg-[var(--card-bg)] border-2 border-red-500/90 shadow-2xl shadow-red-500/10 p-3 text-left select-none cursor-pointer transition-all hover:border-red-400 group backdrop-blur-xl flex flex-col gap-1.5`}
+      title="Click anywhere to swap between Light and Dark mode"
+    >
+      <div className="text-red-500 font-bold underline tracking-wider text-center" style={{ fontSize: '12px', lineHeight: '16px', fontFamily: "'Plus Jakarta Sans', sans-serif" }}>
+        READ THIS ONCE
+      </div>
+      {/* Exact Required Message Text with applied styling */}
+      <p
+        style={{ fontSize: '10px', lineHeight: '15px', fontFamily: "'Plus Jakarta Sans', sans-serif" }}
+        className="text-[var(--text-primary)] font-bold text-center leading-relaxed"
+      >
+        GoGuardian sees whatever theme you are on, and if you are using Classroom/Google Docs/clever.com decoys, the mode automatically changes to white. These platforms do not have dark mode. So to stay hidden, please use white mode when GoGuardian is on. If GoGuardian is not on, you can just swap to dark mode.
+      </p>
+    </motion.div>
+  );
+}
+
+function CursorSpotlight({ active }) {
+  const ref = useRef(null);
+
+  useEffect(() => {
+    if (!active) return;
+
+    const el = ref.current;
+    if (!el) return;
+
+    const handleMouseMove = (e) => {
+      el.style.setProperty('--x', `${e.clientX}px`);
+      el.style.setProperty('--y', `${e.clientY}px`);
+      el.style.opacity = '1';
+    };
+
+    const handleMouseLeave = () => {
+      el.style.opacity = '0';
+    };
+
+    window.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseleave', handleMouseLeave);
+
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseleave', handleMouseLeave);
+    };
+  }, [active]);
+
+  if (!active) return null;
+
+  return (
+    <div
+      ref={ref}
+      className="pointer-events-none fixed inset-0 z-0 transition-opacity duration-500 opacity-0"
+      style={{
+        background: 'radial-gradient(circle 350px at var(--x, -1000px) var(--y, -1000px), color-mix(in srgb, var(--accent-color) 12%, transparent), transparent 80%)',
+      }}
+    />
+  );
+}
+
+function DecoyDropdown({ value, onChange, mode, compact = false, showLabel = false }) {
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const selectedOption = decoyOptions.find(opt => opt.value === value) || decoyOptions[0];
+  const isHighlighted = value !== 'none';
+
+  return (
+    <div ref={dropdownRef} className="relative inline-block text-left">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className={`flex items-center gap-1.5 rounded-full border cursor-pointer transition-all duration-200 select-none ${
+          compact ? 'px-2 py-0.5 text-[10px] h-6' : 'px-3 py-1 text-xs h-8'
+        } ${
+          mode === 'light'
+            ? 'bg-white border-neutral-300 text-neutral-900 shadow-sm hover:border-neutral-400'
+            : isHighlighted
+              ? 'bg-[var(--accent-color)]/10 border-[var(--accent-color)] text-[var(--accent-color)] shadow-[0_1px_5px_var(--accent-shadow)] font-black'
+              : 'bg-[var(--card-bg)] border-[var(--card-border)] text-[var(--text-primary)] hover:border-[var(--accent-color)]/50'
+        }`}
+        style={{ colorScheme: mode }}
+      >
+        {selectedOption.icon === 'school' ? (
+          <School className={`${compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} ${isHighlighted ? (mode === 'light' ? 'text-neutral-900' : 'text-[var(--accent-color)]') : 'text-neutral-400'}`} />
+        ) : (
+          <img src={selectedOption.icon} className={`${compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} object-contain shrink-0`} referrerPolicy="no-referrer" alt="" />
+        )}
+        
+        {showLabel && (
+          <span className="font-mono font-bold leading-none uppercase tracking-tight text-[10px]">
+            {selectedOption.label}
+          </span>
+        )}
+        
+        <ChevronDown className={`${compact ? 'w-2.5 h-2.5' : 'w-3.5 h-3.5'} transition-transform duration-200 shrink-0 ${isOpen ? (mode === 'light' ? 'rotate-180 text-neutral-900' : 'rotate-180 text-[var(--accent-color)]') : 'text-neutral-400'}`} />
+      </button>
+
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 4, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 4, scale: 0.95 }}
+            transition={{ duration: 0.15, ease: 'easeOut' }}
+            className={`absolute top-full right-0 mt-1.5 w-48 rounded-xl border p-1 shadow-2xl z-[2600] overflow-hidden select-none ${
+              mode === 'light'
+                ? 'bg-white border-neutral-200 shadow-xl'
+                : 'bg-[#12121a]/95 backdrop-blur-md border-white/10'
+            }`}
+          >
+            <div className="flex flex-col gap-0.5">
+              {decoyOptions.map((opt) => {
+                const isSelected = opt.value === value;
+                return (
+                  <button
+                    key={opt.value}
+                    onClick={() => {
+                      onChange(opt.value);
+                      setIsOpen(false);
+                    }}
+                    className={`flex items-center gap-2 w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-medium transition-colors duration-150 cursor-pointer ${
+                      isSelected 
+                        ? mode === 'light'
+                          ? 'bg-neutral-900 text-white font-bold'
+                          : 'bg-[var(--accent-color)] text-[var(--bg-color)] font-bold' 
+                        : mode === 'light'
+                          ? 'text-neutral-700 hover:text-black hover:bg-neutral-100'
+                          : 'text-neutral-300 hover:text-white hover:bg-white/5'
+                    }`}
+                  >
+                    {opt.icon === 'school' ? (
+                      <School className={`w-3.5 h-3.5 ${isSelected ? (mode === 'light' ? 'text-white' : 'text-[var(--bg-color)]') : (mode === 'light' ? 'text-neutral-900' : 'text-[var(--accent-color)]')}`} />
+                    ) : (
+                      <img src={opt.icon} className="w-3.5 h-3.5 object-contain shrink-0" referrerPolicy="no-referrer" alt="" />
+                    )}
+                    <span className="flex-1 font-sans truncate">{opt.labelLong}</span>
+                    {isSelected && <Check className="w-3.5 h-3.5 shrink-0" />}
+                  </button>
+                );
+              })}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
+function AutoRandomizeDecoyButton({
+  autoRandomize,
+  setAutoRandomize,
+  interval,
+  setInterval,
+  pool,
+  togglePoolItem,
+  selectAllPool,
+  countdown,
+  onRandomizeNow,
+  currentDecoy,
+  mode,
+  compact = false
+}) {
+  const [isOpen, setIsOpen] = useState(false);
+  const dropdownRef = useRef(null);
+
+  useEffect(() => {
+    const handleClickOutside = (event) => {
+      if (dropdownRef.current && !dropdownRef.current.contains(event.target)) {
+        setIsOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleClickOutside);
+    return () => document.removeEventListener('mousedown', handleClickOutside);
+  }, []);
+
+  const formatInterval = (sec) => {
+    if (sec < 60) return `${sec}s`;
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return s > 0 ? `${m}m ${s}s` : `${m}m`;
+  };
+
+  const presets = [5, 10, 15, 30, 60, 120, 300];
+
+  return (
+    <div ref={dropdownRef} className="relative inline-block text-left">
+      <button
+        onClick={() => setIsOpen(!isOpen)}
+        className={`flex items-center gap-1 rounded-full border cursor-pointer transition-all duration-200 select-none ${
+          compact ? 'px-1.5 py-0.5 text-[10px] h-6' : 'px-2.5 py-1 text-xs h-8'
+        } ${
+          mode === 'light'
+            ? autoRandomize
+              ? 'bg-white border-neutral-900 text-neutral-900 shadow-sm font-black'
+              : 'bg-white border-neutral-300 text-neutral-600 shadow-sm hover:border-neutral-400 hover:text-neutral-900'
+            : autoRandomize
+              ? 'bg-[var(--accent-color)]/15 border-[var(--accent-color)] text-[var(--accent-color)] shadow-[0_0_8px_var(--accent-shadow)] font-black'
+              : 'bg-[var(--card-bg)] border-[var(--card-border)] text-[var(--text-muted)] hover:border-[var(--accent-color)]/50 hover:text-[var(--accent-color)]'
+        }`}
+        title={autoRandomize ? `Auto Randomize: ON (${formatInterval(interval)}) • Next in ${countdown}s` : "Auto Randomize Decoy (Settings)"}
+        aria-label="Auto Randomize Decoy"
+      >
+        <Shuffle className={`${compact ? 'w-3 h-3' : 'w-3.5 h-3.5'} ${autoRandomize ? 'animate-pulse text-[var(--accent-color)]' : ''}`} />
+        {autoRandomize && (
+          <span className="font-mono text-[9px] font-black leading-none px-1 py-0.5 rounded bg-[var(--accent-color)] text-[var(--bg-color)] shadow-xs">
+            {countdown}s
+          </span>
+        )}
+      </button>
+
+      <AnimatePresence>
+        {isOpen && (
+          <motion.div
+            initial={{ opacity: 0, y: 6, scale: 0.95 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 6, scale: 0.95 }}
+            transition={{ duration: 0.15, ease: 'easeOut' }}
+            className="absolute top-full right-0 mt-2 w-72 sm:w-80 rounded-2xl bg-[#12121a]/95 backdrop-blur-xl border border-white/10 p-3.5 shadow-2xl z-[2800] overflow-hidden select-none text-left"
+          >
+            {/* Header */}
+            <div className="flex items-center justify-between border-b border-white/10 pb-2.5 mb-3">
+              <div className="flex items-center gap-2">
+                <div className="p-1.5 rounded-lg bg-[var(--accent-color)]/15 border border-[var(--accent-color)]/30 text-[var(--accent-color)]">
+                  <Shuffle className="w-3.5 h-3.5" />
+                </div>
+                <div>
+                  <h4 className="text-xs font-bold text-white leading-tight">Auto Randomize Decoy</h4>
+                  <p className="text-[10px] text-neutral-400">Cycles disguise automatically</p>
+                </div>
+              </div>
+              <button
+                onClick={() => setIsOpen(false)}
+                className="p-1 rounded-lg hover:bg-white/10 text-neutral-400 hover:text-white transition-colors cursor-pointer"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+
+            {/* Master Toggle */}
+            <div className="bg-white/5 border border-white/10 rounded-xl p-2.5 mb-3 flex items-center justify-between">
+              <div>
+                <span className="text-xs font-bold text-white block">Auto Switch Decoy</span>
+                <span className="text-[10px] text-neutral-400">
+                  {autoRandomize ? `Active • Every ${formatInterval(interval)}` : 'Disabled'}
+                </span>
+              </div>
+              <button
+                onClick={() => setAutoRandomize(!autoRandomize)}
+                className={`relative w-11 h-6 rounded-full transition-colors duration-200 cursor-pointer p-0.5 border ${
+                  autoRandomize ? 'bg-emerald-500 border-emerald-400' : 'bg-neutral-800 border-neutral-700'
+                }`}
+                aria-label="Toggle Auto Switch Decoy"
+              >
+                <div
+                  className={`w-5 h-5 rounded-full bg-white shadow-md transform transition-transform duration-200 ${
+                    autoRandomize ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+
+            {/* Interval Configuration */}
+            <div className="mb-3 bg-white/5 border border-white/10 rounded-xl p-2.5">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[11px] font-bold text-neutral-200 flex items-center gap-1.5">
+                  <Timer className="w-3 h-3 text-[var(--accent-color)]" />
+                  <span>Switch Interval</span>
+                </span>
+                <span className="text-[11px] font-mono font-bold text-[var(--accent-color)] bg-[var(--accent-color)]/10 px-2 py-0.5 rounded-md border border-[var(--accent-color)]/20">
+                  {formatInterval(interval)}
+                </span>
+              </div>
+
+              {/* Slider */}
+              <input
+                type="range"
+                min="3"
+                max="300"
+                step="1"
+                value={interval}
+                onChange={(e) => setInterval(Number(e.target.value))}
+                className="w-full h-1.5 bg-neutral-700 rounded-lg appearance-none cursor-pointer accent-[var(--accent-color)] mb-2.5"
+              />
+
+              {/* Presets */}
+              <div className="flex items-center gap-1 flex-wrap">
+                {presets.map((sec) => (
+                  <button
+                    key={sec}
+                    onClick={() => setInterval(sec)}
+                    className={`text-[10px] font-mono px-2 py-0.5 rounded-md border transition-all cursor-pointer ${
+                      interval === sec
+                        ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] font-bold shadow-xs'
+                        : 'bg-white/5 text-neutral-300 border-white/10 hover:bg-white/10 hover:text-white'
+                    }`}
+                  >
+                    {formatInterval(sec)}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            {/* Choose Decoys Pool */}
+            <div className="mb-3 bg-white/5 border border-white/10 rounded-xl p-2.5">
+              <div className="flex items-center justify-between mb-2">
+                <span className="text-[11px] font-bold text-neutral-200 flex items-center gap-1">
+                  <span>Randomize Pool</span>
+                  <span className="text-[9px] font-mono text-neutral-400">({pool.length}/{decoyOptions.length})</span>
+                </span>
+                <div className="flex items-center gap-1 text-[10px]">
+                  <button
+                    onClick={selectAllPool}
+                    className="text-[var(--accent-color)] hover:underline cursor-pointer font-bold"
+                  >
+                    Select All
+                  </button>
+                </div>
+              </div>
+
+              {/* Decoy options checkboxes */}
+              <div className="grid grid-cols-1 gap-1 max-h-36 overflow-y-auto pr-0.5 scrollbar-thin">
+                {decoyOptions.map((opt) => {
+                  const isChecked = pool.includes(opt.value);
+                  const isCurrent = currentDecoy === opt.value;
+                  return (
+                    <button
+                      key={opt.value}
+                      onClick={() => togglePoolItem(opt.value)}
+                      className={`flex items-center justify-between w-full px-2 py-1 rounded-lg text-xs transition-colors cursor-pointer border ${
+                        isChecked
+                          ? 'bg-white/10 border-white/15 text-white'
+                          : 'bg-transparent border-transparent text-neutral-500 hover:bg-white/5'
+                      }`}
+                    >
+                      <div className="flex items-center gap-2 min-w-0">
+                        {opt.icon === 'school' ? (
+                          <School className="w-3.5 h-3.5 text-[var(--accent-color)] shrink-0" />
+                        ) : (
+                          <img src={opt.icon} className="w-3.5 h-3.5 object-contain shrink-0" referrerPolicy="no-referrer" alt="" />
+                        )}
+                        <span className="truncate text-[11px] font-medium">{opt.labelLong}</span>
+                        {isCurrent && (
+                          <span className="text-[8px] uppercase tracking-wider font-mono font-bold bg-[var(--accent-color)]/20 text-[var(--accent-color)] px-1 rounded">
+                            current
+                          </span>
+                        )}
+                      </div>
+                      <div className={`w-3.5 h-3.5 rounded flex items-center justify-center border transition-all ${
+                        isChecked ? 'bg-[var(--accent-color)] border-[var(--accent-color)] text-[var(--bg-color)]' : 'border-neutral-600'
+                      }`}>
+                        {isChecked && <Check className="w-2.5 h-2.5 stroke-[3]" />}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Footer Action: Randomize Now & Status */}
+            <div className="flex items-center justify-between gap-2 pt-1 border-t border-white/10">
+              <div className="text-[10px] text-neutral-400 font-mono flex items-center gap-1.5">
+                {autoRandomize ? (
+                  <>
+                    <span className="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-ping" />
+                    <span>Next in {countdown}s</span>
+                  </>
+                ) : (
+                  <span className="text-neutral-500">Auto switch off</span>
+                )}
+              </div>
+              <button
+                onClick={onRandomizeNow}
+                className="flex items-center gap-1.5 px-2.5 py-1 text-xs font-bold rounded-lg bg-[var(--accent-color)] text-[var(--bg-color)] hover:brightness-110 active:scale-95 transition-all cursor-pointer shadow-sm"
+                title="Immediately pick another random decoy"
+              >
+                <Shuffle className="w-3 h-3" />
+                <span>Roll Now</span>
+              </button>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
+    </div>
+  );
+}
+
 export default function App() {
+  // Helper to optimize and resize thumbnail URLs dynamically to Poki recommended size (512x512) for fast load & high clarity
+  const getOptimizedThumbnail = (url) => {
+    if (!url) return '';
+
+    if (url.startsWith('http://') || url.startsWith('https://') || url.startsWith('data:')) {
+      if (url.includes('img.poki-cdn.com')) {
+        return url
+          .replace('width=1200', 'width=512')
+          .replace('height=1200', 'height=512');
+      }
+      return url;
+    }
+
+    const clean = url.replace(/^\/+/, '').replace(/^public\//, '').replace(/^thumbnails\//, '');
+    return `/thumbnails/${encodeURI(clean)}`;
+  };
+
   const [theme, setTheme] = useState(() => {
     const saved = safeStorage.getItem('unblocked-theme');
     return saved && ['cyborg', 'violet', 'ice', 'rose-pine', 'none'].includes(saved) ? saved : 'none';
@@ -90,11 +706,586 @@ export default function App() {
     const initialViewMode = safeStorage.getItem('classroom-view-mode') || 'articles';
     return initialViewMode === 'games' ? 'dark' : 'light';
   });
-  const [filter, setFilter] = useState('all');
+
+  const [viewMode, setViewMode] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      if (params.get('unlocked') === 'true' || params.get('view') === 'games') {
+        safeStorage.setItem('classroom-view-mode', 'games');
+        return 'games';
+      }
+    }
+    const saved = safeStorage.getItem('classroom-view-mode');
+    if (saved === 'games') return 'games';
+    return 'articles'; // Innocent educational syllabus base is shown on first startup
+  });
+
+  const isPasscodeUnlocked = viewMode === 'games';
+
+  // Classroom/Games Cloak/Decoy State
+  const [decoyType, setDecoyType] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const urlDecoyType = params.get('decoyType');
+      if (urlDecoyType && ['classroom', 'canva', 'clever', 'campus', 'docs', 'gmail', 'duolingo', 'ixl'].includes(urlDecoyType)) {
+        return urlDecoyType;
+      }
+      const urlDecoy = params.get('decoy');
+      if (urlDecoy === 'true') return 'classroom';
+      if (urlDecoy === 'false') return 'classroom';
+      if (urlDecoy && ['classroom', 'canva', 'clever', 'campus', 'docs', 'gmail', 'duolingo', 'ixl'].includes(urlDecoy)) {
+        return urlDecoy;
+      }
+      const cached = localStorage.getItem('study-tools-decoy-type');
+      if (cached && ['classroom', 'canva', 'clever', 'campus', 'docs', 'gmail', 'duolingo', 'ixl'].includes(cached)) {
+        return cached;
+      }
+    }
+    return 'classroom';
+  });
+
+  const isWhiteDecoy = decoyType === 'classroom' || decoyType === 'docs' || decoyType === 'clever';
+  const [showGoGuardianNotice, setShowGoGuardianNotice] = useState(() => {
+    const hasShownBefore = safeStorage.getItem('unblocked-goguardian-notice-shown');
+    const initialViewMode = safeStorage.getItem('classroom-view-mode');
+    return !hasShownBefore && isWhiteDecoy && initialViewMode !== 'games';
+  });
+
+  // Ensure notice does not automatically pop open when in the portals secured area
+  useEffect(() => {
+    if (viewMode === 'games') {
+      setShowGoGuardianNotice(false);
+    }
+  }, [viewMode]);
+
+  // Automatically switch to white mode on classroom, google docs, and clever decoys
+  useEffect(() => {
+    if (decoyType === 'classroom' || decoyType === 'docs' || decoyType === 'clever') {
+      setMode('light');
+    }
+  }, [decoyType]);
+
+  // Persist decoy state to localStorage
+  useEffect(() => {
+    localStorage.setItem('study-tools-decoy-type', decoyType);
+    localStorage.setItem('study-tools-classroom-decoy', 'true');
+  }, [decoyType]);
+
+  // Auto Randomize Decoy State & Controls
+  const [autoRandomizeDecoy, setAutoRandomizeDecoy] = useState(() => {
+    const saved = safeStorage.getItem('study-tools-auto-randomize');
+    return saved === 'true';
+  });
+
+  const [randomizeInterval, setRandomizeInterval] = useState(() => {
+    const saved = safeStorage.getItem('study-tools-randomize-interval');
+    const num = Number(saved);
+    return !isNaN(num) && num >= 3 && num <= 300 ? num : 15;
+  });
+
+  const [randomizePool, setRandomizePool] = useState(() => {
+    try {
+      const saved = safeStorage.getItem('study-tools-randomize-pool');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) {
+          const valid = parsed.filter(p => decoyOptions.some(d => d.value === p));
+          if (valid.length > 0) return valid;
+        }
+      }
+    } catch {}
+    return ['classroom', 'clever', 'campus', 'docs', 'gmail', 'duolingo', 'ixl'];
+  });
+
+  const [randomizeCountdown, setRandomizeCountdown] = useState(randomizeInterval);
+
+  useEffect(() => {
+    safeStorage.setItem('study-tools-auto-randomize', String(autoRandomizeDecoy));
+  }, [autoRandomizeDecoy]);
+
+  const updateRandomizeInterval = (sec) => {
+    const clamped = Math.max(3, Math.min(300, Number(sec) || 15));
+    setRandomizeInterval(clamped);
+    setRandomizeCountdown(clamped);
+    safeStorage.setItem('study-tools-randomize-interval', String(clamped));
+  };
+
+  const toggleDecoyInPool = (val) => {
+    setRandomizePool((prev) => {
+      let updated;
+      if (prev.includes(val)) {
+        if (prev.length <= 1) return prev; // Keep at least one
+        updated = prev.filter(item => item !== val);
+      } else {
+        updated = [...prev, val];
+      }
+      safeStorage.setItem('study-tools-randomize-pool', JSON.stringify(updated));
+      return updated;
+    });
+  };
+
+  const selectAllDecoys = () => {
+    const all = decoyOptions.map(d => d.value);
+    setRandomizePool(all);
+    safeStorage.setItem('study-tools-randomize-pool', JSON.stringify(all));
+  };
+
+  const triggerManualRandomize = () => {
+    const activePool = randomizePool.length > 0 ? randomizePool : decoyOptions.map(d => d.value);
+    const choices = activePool.length > 1 ? activePool.filter(d => d !== decoyType) : activePool;
+    const next = choices[Math.floor(Math.random() * choices.length)] || decoyType;
+    setDecoyType(next);
+    setRandomizeCountdown(randomizeInterval);
+  };
+
+  // Timer loop for auto-randomization
+  useEffect(() => {
+    if (!autoRandomizeDecoy || viewMode !== 'games') {
+      return;
+    }
+
+    setRandomizeCountdown(randomizeInterval);
+
+    const timer = setInterval(() => {
+      setRandomizeCountdown((prev) => {
+        if (prev <= 1) {
+          setDecoyType((curr) => {
+            const activePool = randomizePool.length > 0 ? randomizePool : decoyOptions.map(d => d.value);
+            const choices = activePool.length > 1 ? activePool.filter(d => d !== curr) : activePool;
+            const next = choices[Math.floor(Math.random() * choices.length)] || curr;
+            return next;
+          });
+          return randomizeInterval;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timer);
+  }, [autoRandomizeDecoy, randomizeInterval, randomizePool, viewMode]);
+  const [filter, setFilter] = useState(() => {
+    try {
+      const hasVisited = safeStorage.getItem('has-visited-before');
+      if (!hasVisited) {
+        safeStorage.setItem('has-visited-before', 'true');
+        return 'info';
+      }
+      const saved = safeStorage.getItem('unblocked-last-filter');
+      return saved || 'all';
+    } catch {
+      return 'info';
+    }
+  });
+  const [hasUnreadLobby, setHasUnreadLobby] = useState(() => {
+    const latest = Number(safeStorage.getItem('lobby-chat-latest') || 0);
+    const lastRead = Number(safeStorage.getItem('lobby-chat-last-read') || 0);
+    return latest > lastRead;
+  });
+  const filterRef = useRef(filter);
+  const markLobbyUnread = (latest) => {
+    const timestamp = Number(latest || 0);
+    if (!timestamp) return;
+    safeStorage.setItem('lobby-chat-latest', String(timestamp));
+    const lastRead = Number(safeStorage.getItem('lobby-chat-last-read') || 0);
+    if (filterRef.current !== 'lobbychat' && timestamp > lastRead) {
+      setHasUnreadLobby(true);
+    }
+  };
+  useEffect(() => {
+    filterRef.current = filter;
+    if (filter === 'lobbychat') {
+      const latest = Number(safeStorage.getItem('lobby-chat-latest') || 0);
+      if (latest > 0) safeStorage.setItem('lobby-chat-last-read', String(latest));
+      setHasUnreadLobby(false);
+    }
+  }, [filter]);
+  useEffect(() => {
+    const handleLobbyMessage = (event) => {
+      if (event.origin !== window.location.origin) return;
+      if (event.data?.type === 'lobby-chat-message') {
+        markLobbyUnread(event.data.timestamp);
+      }
+    };
+    const handleLobbyStorage = (event) => {
+      if (event.key === 'lobby-chat-notification' && event.newValue) {
+        markLobbyUnread(event.newValue);
+      }
+    };
+    window.addEventListener('message', handleLobbyMessage);
+    window.addEventListener('storage', handleLobbyStorage);
+    return () => {
+      window.removeEventListener('message', handleLobbyMessage);
+      window.removeEventListener('storage', handleLobbyStorage);
+    };
+  }, []);
+  useEffect(() => {
+    let unsubscribe;
+    let cancelled = false;
+
+    const subscribeToLobby = async () => {
+      try {
+        await signInAnonymously(lobbyAuth);
+        if (cancelled) return;
+        const messagesQuery = query(
+          collection(lobbyDb, 'channels', 'general', 'messages'),
+          orderBy('timestamp', 'desc'),
+          limit(1),
+        );
+        unsubscribe = onSnapshot(messagesQuery, (snapshot) => {
+          const latest = Number(snapshot.docs[0]?.data()?.timestamp || 0);
+          if (!latest) return;
+          const storedLastRead = safeStorage.getItem('lobby-chat-last-read');
+          if (storedLastRead === null) {
+            safeStorage.setItem('lobby-chat-last-read', String(latest));
+            return;
+          }
+          markLobbyUnread(latest);
+        }, (error) => {
+          console.warn('Lobby unread listener error:', error);
+        });
+      } catch (error) {
+        console.warn('Lobby unread auth error:', error);
+      }
+    };
+
+    subscribeToLobby();
+    return () => {
+      cancelled = true;
+      if (unsubscribe) unsubscribe();
+    };
+  }, []);
   const [searchQuery, setSearchQuery] = useState('');
+  const deferredSearchQuery = useDeferredValue(searchQuery);
+  const [currentGamePage, setCurrentGamePage] = useState(1);
+  const [gameCatalogMode, setGameCatalogMode] = useState(() => {
+    try {
+      return safeStorage.getItem('unblocked-game-catalog-mode') || 'original';
+    } catch {
+      return 'original';
+    }
+  });
+  const [targetPageInput, setTargetPageInput] = useState('');
+  const [games, setGames] = useState([]);
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [selectedGame, setSelectedGame] = useState(null);
+  const [gameFrame, setGameFrame] = useState(null);
+  const restoredSavedGame = useRef(false);
+
+  useEffect(() => {
+    let active = true;
+    import('./data/gameCatalog').then(({ games: loadedGames }) => {
+      if (active) setGames(loadedGames);
+    });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (games.length === 0 || selectedGame || restoredSavedGame.current) return;
+    const isWorkspace = ['chat', 'lobbychat', 'movies', 'youtube', 'info', 'download'].includes(filter);
+    if (isWorkspace) return;
+    restoredSavedGame.current = true;
+    const savedId = safeStorage.getItem('unblocked-last-game');
+    if (savedId) {
+      setSelectedGame(games.find((game) => game.id === savedId) || null);
+    }
+  }, [games, selectedGame, filter]);
+
+  useEffect(() => {
+    if (!selectedGame) {
+      setGameFrame(null);
+      return undefined;
+    }
+
+    const cachedFrame = gameHtmlCache.get(selectedGame.url);
+    if (cachedFrame) {
+      setGameFrame(cachedFrame);
+      return undefined;
+    }
+
+    const controller = new AbortController();
+    setGameFrame(null);
+
+    loadGameFrame(selectedGame.url, controller.signal)
+      .then((frame) => {
+        gameHtmlCache.set(selectedGame.url, frame);
+        setGameFrame(frame);
+      })
+      .catch((error) => {
+        if (error.name !== 'AbortError') setGameFrame(createGameLoadErrorDocument(selectedGame.url));
+      });
+
+    return () => controller.abort();
+  }, [selectedGame]);
+
+  const [gameHeaderHidden, setGameHeaderHidden] = useState(false);
+  const [isBootComplete, setIsBootComplete] = useState(false);
+  const [autoHideHeader, setAutoHideHeader] = useState(() => {
+    const saved = safeStorage.getItem('unblocked-auto-hide-header');
+    return saved === null ? true : saved === 'true'; // Defaults to true
+  });
+  const [altBarOpen, setAltBarOpen] = useState(true);
+  const [headerOpen, setHeaderOpen] = useState(false);
+  const [searchExpanded, setSearchExpanded] = useState(false);
+  const searchInputRef = useRef(null);
+
+  const compactHeaderRef = useRef(null);
+  const compactLeftRef = useRef(null);
+  const compactRightRef = useRef(null);
+  const compactCenterRef = useRef(null);
+
+  useEffect(() => {
+    safeStorage.setItem('unblocked-last-filter', filter);
+    const isWorkspace = ['chat', 'lobbychat', 'movies', 'youtube', 'info', 'download'].includes(filter);
+    if (isWorkspace) {
+      setSelectedGame(null);
+      setGameHeaderHidden(false);
+      setWindowFullscreen(false);
+      safeStorage.removeItem('unblocked-last-game');
+    }
+  }, [filter]);
+
+  useEffect(() => {
+    const raf = requestAnimationFrame(() => setIsBootComplete(true));
+    return () => cancelAnimationFrame(raf);
+  }, []);
+
+  useEffect(() => {
+    const isWorkspace = ['chat', 'lobbychat', 'movies', 'youtube', 'info', 'download'].includes(filter);
+    if (isWorkspace) {
+      setGameHeaderHidden(false);
+      setWindowFullscreen(false);
+      return;
+    }
+    if (selectedGame) {
+      safeStorage.setItem('unblocked-last-game', selectedGame.id);
+      if (autoHideHeader && isBootComplete) {
+        setGameHeaderHidden(true);
+      } else {
+        setGameHeaderHidden(false);
+      }
+    } else {
+      if (games.length === 0) return;
+      safeStorage.removeItem('unblocked-last-game');
+      setWindowFullscreen(false);
+      setGameHeaderHidden(false);
+    }
+  }, [selectedGame, autoHideHeader, games.length, filter, isBootComplete]);
+
+  useEffect(() => {
+    setCurrentGamePage(1);
+  }, [filter, searchQuery, selectedGame]);
+  const [showGithubNotice, setShowGithubNotice] = useState(() => {
+    return safeStorage.getItem('academic-github-notice-dismissed') !== 'true';
+  });
+
+  const openWorkspaceInAboutBlank = (currentFilter) => {
+    let url = "";
+    if (currentFilter === 'movies') {
+      url = window.location.origin + '?filter=movies&view=games';
+    } else if (currentFilter === 'youtube') {
+      url = 'https://urnperiodic.github.io/youtube1/';
+    } else if (currentFilter === 'chat') {
+      url = 'https://grandplat2.vercel.app/';
+    } else if (currentFilter === 'lobbychat') {
+      url = window.location.origin + '?filter=lobbychat&view=games';
+    } else if (currentFilter === 'download') {
+      url = 'https://urnperiodic.github.io/download/';
+    } else {
+      const searchParams = new URLSearchParams(window.location.search);
+      searchParams.set('decoyType', decoyType);
+      searchParams.set('view', 'games');
+      if (selectedGame) {
+        searchParams.set('game', selectedGame.id);
+      }
+      url = `${window.location.origin}${window.location.pathname}?${searchParams.toString()}${window.location.hash}`;
+    }
+
+    const win = window.open('about:blank', '_blank');
+    if (win) {
+      let parentTitle = "Urnperiodic StudyTools";
+      let parentFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
+      
+      if (decoyType === 'classroom') {
+        parentTitle = "Home - Classroom";
+        parentFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
+      } else if (decoyType === 'canva') {
+        parentTitle = "Home - Canva";
+        parentFavicon = "https://static.canva.com/domain-assets/canva/static/images/favicon-1.ico";
+      } else if (decoyType === 'clever') {
+        parentTitle = "Clever | Log in with Clever";
+        parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=clever.com";
+      } else if (decoyType === 'campus') {
+        parentTitle = "Campus Student";
+        parentFavicon = "https://jerseycitynj.infinitecampus.org/campus/favicon-32x32.png";
+      } else if (decoyType === 'docs') {
+        parentTitle = "Google Docs";
+        parentFavicon = "https://ssl.gstatic.com/docs/documents/images/docs-favicon-2026-v2.ico";
+      } else if (decoyType === 'gmail') {
+        parentTitle = "Inbox - Jersey City Public Schools";
+        parentFavicon = "https://ssl.gstatic.com/ui/v1/icons/mail/images/favicon_gmail_2026_v2.ico";
+      } else if (decoyType === 'duolingo') {
+        parentTitle = "Duolingo - Learn a language for free";
+        parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=duolingo.com";
+      } else if (decoyType === 'ixl') {
+        parentTitle = "IXL | Math, Language Arts, Science, Social Studies, and Spanish";
+        parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=ixl.com";
+      }
+
+      win.document.title = parentTitle;
+      const link1 = win.document.createElement("link"); link1.rel = "icon"; link1.href = parentFavicon;
+      const link2 = win.document.createElement("link"); link2.rel = "shortcut icon"; link2.href = parentFavicon;
+      win.document.head.appendChild(link1); win.document.head.appendChild(link2);
+      win.document.body.style.margin = "0"; win.document.body.style.padding = "0"; win.document.body.style.width = "100%"; win.document.body.style.height = "100%"; win.document.body.style.overflow = "hidden"; win.document.body.style.background = "#000";
+      const iframe = win.document.createElement("iframe"); iframe.src = url; iframe.style.width = "100vw"; iframe.style.height = "100vh"; iframe.style.border = "none"; iframe.style.display = "block"; iframe.style.margin = "0"; iframe.style.padding = "0"; iframe.setAttribute("allow", "fullscreen; autoplay; encrypted-media; picture-in-picture; clipboard-write; microphone; camera; geolocation"); iframe.setAttribute("allowfullscreen", "true");
+      win.document.body.appendChild(iframe);
+    } else {
+      alert("Popup blocked! Please allow popups for this site.");
+    }
+  };
+
+  const openGameInAboutBlank = (gameToOpen) => {
+    if (!gameToOpen) return;
+    const win = window.open("about:blank", "_blank");
+    if (!win) {
+      alert("Popup blocked. Allow popups for this site.");
+      return;
+    }
+    const classroomFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
+    let tabTitle = gameToOpen.title;
+    let tabFavicon = classroomFavicon;
+    if (decoyType === 'classroom') {
+      tabTitle = "Home - Classroom";
+      tabFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
+    } else if (decoyType === 'canva') {
+      tabTitle = "Home - Canva";
+      tabFavicon = "https://static.canva.com/domain-assets/canva/static/images/favicon-1.ico";
+    } else if (decoyType === 'clever') {
+      tabTitle = "Clever | Log in with Clever";
+      tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=clever.com";
+    } else if (decoyType === 'campus') {
+      tabTitle = "Campus Student";
+      tabFavicon = "https://jerseycitynj.infinitecampus.org/campus/favicon-32x32.png";
+    } else if (decoyType === 'docs') {
+      tabTitle = "Google Docs";
+      tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=docs.google.com";
+    } else if (decoyType === 'gmail') {
+      tabTitle = "Inbox - Jersey City Public Schools";
+      tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=mail.google.com";
+    } else if (decoyType === 'duolingo') {
+      tabTitle = "Duolingo - Learn a language for free";
+      tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=duolingo.com";
+    } else if (decoyType === 'ixl') {
+      tabTitle = "IXL | Math, Language Arts, Science, Social Studies, and Spanish";
+      tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=ixl.com";
+    }
+
+    win.document.write(`
+      <!DOCTYPE html>
+      <html>
+      <head>
+        <title>${tabTitle}</title>
+        <link rel="icon" type="image/png" href="${tabFavicon}">
+        <link rel="shortcut icon" type="image/png" href="${tabFavicon}">
+        <meta charset="utf-8">
+        <style>
+          html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; }
+          iframe { width: 100vw; height: 100vh; border: none; display: block; }
+        </style>
+        <script>
+          function forceFavicon() {
+            const head = document.head || document.getElementsByTagName('head')[0];
+            const links = document.querySelectorAll("link[rel*='icon']");
+            links.forEach(function(el) { el.remove(); });
+
+            const newLink = document.createElement('link');
+            newLink.rel = 'icon';
+            newLink.type = 'image/png';
+            newLink.href = '${tabFavicon}';
+            head.appendChild(newLink);
+
+            const shortcutLink = document.createElement('link');
+            shortcutLink.rel = 'shortcut icon';
+            shortcutLink.type = 'image/png';
+            shortcutLink.href = '${tabFavicon}';
+            head.appendChild(shortcutLink);
+
+            document.title = "${tabTitle}";
+          }
+
+          forceFavicon();
+          window.onload = forceFavicon;
+          setTimeout(forceFavicon, 50);
+          setTimeout(forceFavicon, 150);
+          setTimeout(forceFavicon, 500);
+        </script>
+      </head>
+      <body>
+        <iframe id="about-blank-game-frame" allow="fullscreen; autoplay; encrypted-media; picture-in-picture; clipboard-write; microphone; camera; geolocation" referrerpolicy="no-referrer"></iframe>
+      </body>
+      </html>
+    `);
+    win.document.close();
+
+    const frame = win.document.getElementById('about-blank-game-frame');
+    const cachedFrame = gameHtmlCache.get(gameToOpen.url);
+    const loadGameHtml = cachedFrame
+      ? Promise.resolve(cachedFrame)
+      : loadGameFrame(gameToOpen.url).then((gameFrame) => {
+          gameHtmlCache.set(gameToOpen.url, gameFrame);
+          return gameFrame;
+        });
+
+    loadGameHtml
+      .then((gameFrameData) => {
+        if (!win.closed) {
+          if (gameFrameData.src) {
+            frame.src = gameFrameData.src;
+          } else {
+            frame.srcdoc = gameFrameData.srcDoc;
+          }
+        }
+      })
+      .catch(() => {
+        if (!win.closed) frame.srcdoc = createGameLoadErrorDocument(gameToOpen.url).srcDoc;
+      });
+  };
+
+  // States for collapsible & resizable docked game chat
+  const [dockedChatWidth, setDockedChatWidth] = useState(235); // 235px lowest width
+  const [dockedChatCollapsed, setDockedChatCollapsed] = useState(true);
+  const [isDraggingDock, setIsDraggingDock] = useState(false);
+
+  // Monitor mouse moving & mouse up for docking drag resize
+  useEffect(() => {
+    if (!isDraggingDock) return;
+    const handleMouseMove = (e) => {
+      const container = document.getElementById('game-arena-container');
+      if (!container) return;
+      const rect = container.getBoundingClientRect();
+      const width = rect.right - e.clientX;
+      
+      // Clamp width: min 180px, max 50% of the game arena container width
+      const minW = 180;
+      const maxW = Math.min(600, rect.width * 0.5);
+      if (width >= minW && width <= maxW) {
+        setDockedChatWidth(width);
+      }
+    };
+    const handleMouseUp = () => {
+      setIsDraggingDock(false);
+    };
+    document.addEventListener('mousemove', handleMouseMove);
+    document.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      document.removeEventListener('mousemove', handleMouseMove);
+      document.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, [isDraggingDock]);
+
   const [zoom, setZoom] = useState(1);
+  const [windowFullscreen, setWindowFullscreen] = useState(false);
   const [failedThumbnails, setFailedThumbnails] = useState({});
   const [favorites, setFavorites] = useState(() => {
     try {
@@ -105,108 +1296,259 @@ export default function App() {
     }
   });
 
-  const [viewMode, setViewMode] = useState(() => {
-    const saved = safeStorage.getItem('classroom-view-mode');
-    if (saved === 'games') return 'games';
-    return 'articles'; // Innocent educational syllabus base is shown on first startup
-  });
-
-  const isPasscodeUnlocked = viewMode === 'games';
-
   const setViewModeAndSave = (mode) => {
     setViewMode(mode);
     safeStorage.setItem('classroom-view-mode', mode);
     safeStorage.setItem('classroom-passcode-unlocked', mode === 'games' ? 'true' : 'false');
+    if (mode === 'games') {
+      setHeaderOpen(false);
+      setSidebarOpen(false);
+    }
   };
+
+    useEffect(() => {
+      if (viewMode === 'games') {
+        setHeaderOpen(false);
+        setSidebarOpen(false);
+      }
+    }, [viewMode]);
+
+  const [autoLockOnClose, setAutoLockOnClose] = useState(() => {
+    const saved = safeStorage.getItem('unblocked-auto-lock-on-close');
+    return saved !== 'false'; // Defaults to true
+  });
+
+  const [panicKeysEnabled, setPanicKeysEnabled] = useState(() => {
+    const saved = safeStorage.getItem('unblocked-panic-keys-enabled');
+    return saved !== 'false'; // Defaults to true
+  });
+
+  const [historyMaskingEnabled, setHistoryMaskingEnabled] = useState(() => {
+    const saved = safeStorage.getItem('unblocked-history-masking');
+    return saved !== 'false'; // Defaults to true
+  });
+
+  // Browser History Sanitization & Masking Engine
+  // Continuously prevents game titles, sub-paths, and gaming query parameters
+  // from accumulating in your browser history stack by leveraging history.replaceState()
+  useEffect(() => {
+    if (!historyMaskingEnabled || typeof window === 'undefined') return;
+
+    try {
+      // Determine clean benign root or standard path
+      const currentUrl = window.location;
+      const cleanPath = currentUrl.pathname || '/';
+      
+      // If there are lingering gaming query parameters, sanitize them in-place
+      const searchParams = new URLSearchParams(currentUrl.search);
+      let needsSanitize = false;
+
+      // Check if URL has gaming query parameters that should be wiped from history
+      ['filter', 'view', 'unlocked', 'game', 'id', 'search'].forEach(param => {
+        if (searchParams.has(param)) {
+          searchParams.delete(param);
+          needsSanitize = true;
+        }
+      });
+
+      const sanitizedUrl = needsSanitize 
+        ? (searchParams.toString() ? `${cleanPath}?${searchParams.toString()}` : cleanPath)
+        : cleanPath;
+
+      const maskedState = {
+        disguise: 'educational_workspace',
+        app: 'Google Classroom',
+        timestamp: Date.now()
+      };
+
+      // Replace current history entry in place - NEVER pushes a new entry
+      window.history.replaceState(maskedState, document.title, sanitizedUrl);
+    } catch (e) {
+      // Gracefully handle iframe sandbox or restricted origin policies
+    }
+  }, [historyMaskingEnabled, selectedGame, filter, viewMode, decoyType]);
+
+  // Sign Out / Lock Workspace when tab or window is closed
+  useEffect(() => {
+    const handleUnload = () => {
+      if (autoLockOnClose) {
+        safeStorage.setItem('classroom-view-mode', 'articles');
+        safeStorage.setItem('classroom-passcode-unlocked', 'false');
+      }
+    };
+
+    window.addEventListener('beforeunload', handleUnload);
+    window.addEventListener('pagehide', handleUnload);
+
+    return () => {
+      window.removeEventListener('beforeunload', handleUnload);
+      window.removeEventListener('pagehide', handleUnload);
+    };
+  }, [autoLockOnClose]);
 
   const [passcode, setPasscode] = useState('');
   const [isShake, setIsShake] = useState(false);
   const [errorCount, setErrorCount] = useState(0);
+  const [isGlobalSettingsOpen, setIsGlobalSettingsOpen] = useState(false);
+  // Animations state: disabled by default at start for Chromebook performance
+  const [animationsEnabled, setAnimationsEnabled] = useState(() => {
+    try {
+      return safeStorage.getItem('unblocked-animations-enabled') === 'true';
+    } catch {
+      return false;
+    }
+  });
+
+  const toggleAnimations = () => {
+    setAnimationsEnabled(prev => {
+      const next = !prev;
+      try {
+        safeStorage.setItem('unblocked-animations-enabled', String(next));
+      } catch {
+        // ignore
+      }
+      return next;
+    });
+  };
+
+  useEffect(() => {
+    try {
+      if (animationsEnabled) {
+        document.documentElement.classList.remove('animations-disabled');
+        document.documentElement.setAttribute('data-animations', 'enabled');
+      } else {
+        document.documentElement.classList.add('animations-disabled');
+        document.documentElement.setAttribute('data-animations', 'disabled');
+      }
+    } catch {
+      // Safe fallback
+    }
+  }, [animationsEnabled]);
+  const [showNotices, setShowNotices] = useState(false);
+  const [noticeStep, setNoticeStep] = useState(0); // 0: Download, 1: Movies, 2: Cloak, 3: Decoy
+  const [noticeCountdown, setNoticeCountdown] = useState(20);
+
+  const closeNotices = () => {
+    setShowNotices(false);
+    safeStorage.setItem('notices-seen', 'true');
+  };
+
+  useEffect(() => {
+    if (!showNotices) return;
+    setNoticeCountdown(20);
+    const interval = setInterval(() => {
+      setNoticeCountdown((prev) => {
+        if (prev <= 1) {
+          setNoticeStep((step) => {
+            if (step >= 3) {
+              closeNotices();
+              return 0;
+            }
+            return step + 1;
+          });
+          return 20;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+    return () => clearInterval(interval);
+  }, [showNotices, noticeStep]);
+
+  const nextNoticeStep = () => {
+    if (noticeStep >= 3) {
+      closeNotices();
+    } else {
+      setNoticeStep((prev) => prev + 1);
+      setNoticeCountdown(20);
+    }
+  };
+
+  const prevNoticeStep = () => {
+    if (noticeStep > 0) {
+      setNoticeStep((prev) => prev - 1);
+      setNoticeCountdown(20);
+    }
+  };
+
+  const reshowAllNotices = () => {
+    setFilter('info');
+    setSelectedGame(null);
+  };
+
+  const reshowDownloadNotice = () => {
+    setFilter('info');
+    setSelectedGame(null);
+  };
 
   // Articles and Custom AI article generator states
   const [activeEduTab, setActiveEduTab] = useState('articles'); // 'articles' | 'flashcards' | 'grammar' | 'quiz'
   const [articles, setArticles] = useState(initialArticles);
-  const [selectedArticleId, setSelectedArticleId] = useState(initialArticles[0].id);
+  const [selectedArticleId, setSelectedArticleId] = useState(initialArticles[0]?.id || '');
   const [articleSearch, setArticleSearch] = useState('');
   const [selectedArticleCategory, setSelectedArticleCategory] = useState('All');
-  const [newArticleGame, setNewArticleGame] = useState(gameOptions[0].value);
-  const [newArticleTone, setNewArticleTone] = useState(toneOptions[0].value);
-  const [customPromptText, setCustomPromptText] = useState(`Write an educational, informational article focusing on ${gameOptions[0].value} concepts suited for school reading.`);
-  const [isPromptUserModified, setIsPromptUserModified] = useState(false);
-  const [isGeneratingArticle, setIsGeneratingArticle] = useState(false);
-  const [generationProgress, setGenerationProgress] = useState(0);
 
-  // Classroom/Games Cloak/Decoy State
-  const [decoyType, setDecoyType] = useState(() => {
-    if (typeof window !== 'undefined') {
-      const params = new URLSearchParams(window.location.search);
-      const urlDecoyType = params.get('decoyType');
-      if (urlDecoyType && ['none', 'classroom', 'clever', 'campus', 'docs', 'gmail'].includes(urlDecoyType)) {
-        return urlDecoyType;
-      }
-      const urlDecoy = params.get('decoy');
-      if (urlDecoy === 'true') return 'classroom';
-      if (urlDecoy === 'false') return 'none';
-      if (urlDecoy && ['none', 'classroom', 'clever', 'campus', 'docs', 'gmail'].includes(urlDecoy)) {
-        return urlDecoy;
-      }
-      const cached = localStorage.getItem('study-tools-decoy-type');
-      if (cached && ['none', 'classroom', 'clever', 'campus', 'docs', 'gmail'].includes(cached)) {
-        return cached;
-      }
-      const cachedLegacy = localStorage.getItem('study-tools-classroom-decoy');
-      if (cachedLegacy === 'true') return 'classroom';
-    }
-    return 'none';
-  });
-
-  const useClassroomDecoy = decoyType !== 'none';
-
-  const [aboutBlankSuffix, setAboutBlankSuffix] = useState('');
-
-  // Persist decoy state to localStorage
-  useEffect(() => {
-    localStorage.setItem('study-tools-decoy-type', decoyType);
-    localStorage.setItem('study-tools-classroom-decoy', String(decoyType !== 'none'));
-  }, [decoyType]);
-
-  // Set white as the main starting color for articles (light mode), and black for games (dark mode)
+  // Set white as the main starting color for articles (light mode), and for classroom/docs decoys
   useEffect(() => {
     if (viewMode === 'articles') {
       setMode('light');
     } else if (viewMode === 'games') {
-      setMode('dark');
+      if (decoyType === 'classroom' || decoyType === 'docs' || decoyType === 'clever') {
+        setMode('light');
+      } else {
+        setMode('dark');
+      }
     }
-  }, [viewMode]);
-
-  const handleGenerateArticle = () => {
-    if (isGeneratingArticle) return;
-    setIsGeneratingArticle(true);
-    setGenerationProgress(0);
-
-    const interval = setInterval(() => {
-      setGenerationProgress((prev) => {
-        if (prev >= 100) {
-          clearInterval(interval);
-          setTimeout(() => {
-            const article = generateMockAIArticle(newArticleGame, newArticleTone, customPromptText);
-            setArticles((prevArticles) => [article, ...prevArticles]);
-            setSelectedArticleCategory(article.category);
-            setSelectedArticleId(article.id);
-            setIsGeneratingArticle(false);
-          }, 200);
-          return 100;
-        }
-        return prev + 5;
-      });
-    }, 45);
-  };
+  }, [viewMode, decoyType]);
 
   const handlePasswordSubmit = (customPass) => {
     const inputPass = (customPass !== undefined ? customPass : passcode).trim().toLowerCase();
     if (!inputPass) return;
 
-    if (inputPass === 'ttt0609' || inputPass === '1378' || inputPass === '') {
+    if (inputPass === 'ttt0609') {
+      const win = window.open("about:blank", "_blank");
+      if (win) {
+        // Automatically save that we are unlocked so the iframe can read it
+        safeStorage.setItem('classroom-view-mode', 'games');
+        safeStorage.setItem('classroom-passcode-unlocked', 'true');
+
+        const searchParams = new URLSearchParams(window.location.search);
+        searchParams.set('unlocked', 'true');
+        searchParams.set('decoyType', decoyType);
+        const iframeSrc = `${window.location.origin}${window.location.pathname}?${searchParams.toString()}${window.location.hash}`;
+        
+        let parentTitle = "Urnperiodic StudyTools";
+        let parentFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
+        
+        if (decoyType === 'classroom') {
+          parentTitle = "Home - Classroom";
+          parentFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
+        } else if (decoyType === 'clever') {
+          parentTitle = "Clever | Log in with Clever";
+          parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=clever.com";
+        } else if (decoyType === 'campus') {
+          parentTitle = "Campus Student";
+          parentFavicon = "https://jerseycitynj.infinitecampus.org/campus/favicon-32x32.png";
+        } else if (decoyType === 'docs') {
+          parentTitle = "Google Docs";
+          parentFavicon = "https://ssl.gstatic.com/docs/documents/images/docs-favicon-2026-v2.ico";
+        } else if (decoyType === 'gmail') {
+          parentTitle = "Inbox - Jersey City Public Schools";
+          parentFavicon = "https://ssl.gstatic.com/ui/v1/icons/mail/images/favicon_gmail_2026_v2.ico";
+        } else if (decoyType === 'duolingo') {
+          parentTitle = "Duolingo - Learn a language for free";
+          parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=duolingo.com";
+        } else if (decoyType === 'ixl') {
+          parentTitle = "IXL | Math, Language Arts, Science, Social Studies, and Spanish";
+          parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=ixl.com";
+        }
+
+        win.document.write(`<html><head><title>${parentTitle}</title><link rel="icon" href="${parentFavicon}"><style>html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#0c0a09;}iframe{width:100vw;height:100vh;border:none;display:block;}</style></head><body><iframe src="${iframeSrc}" allow="fullscreen"></iframe></body></html>`);
+        win.document.close();
+      } else {
+        alert("Popup blocked! Please allow popups to open the portals in a cloaked tab.");
+      }
+      setPasscode('');
+    } else if (inputPass === 'tt0609' || inputPass === '1378') {
       setTimeout(() => {
         setViewModeAndSave('games');
         setPasscode('');
@@ -294,10 +1636,14 @@ export default function App() {
 
   // Automated trigger checks for "0609" and "2026" within the article system's search tab
   useEffect(() => {
-    if (articleSearch === '2026' || articleSearch.toLowerCase() === 'ttt0609') {
+    const q = articleSearch.trim().toLowerCase();
+    if (q === 'ttt0609') {
+      setArticleSearch('');
+      handlePasswordSubmit('ttt0609');
+    } else if (q === '2026' || q === 'tt0609') {
       setViewModeAndSave('games');
       setArticleSearch('');
-    } else if (articleSearch === '0609') {
+    } else if (q === '0609') {
       setViewModeAndSave('locked');
       setArticleSearch('');
     }
@@ -336,15 +1682,100 @@ export default function App() {
 
   // Global Panic Key Handler
   useEffect(() => {
+    let lastZeroTime = 0;
+    let lastEscapeTime = 0;
     const handlePanic = (e) => {
       if (e.key === '[' || e.key === ']') {
+        if (!panicKeysEnabled) return;
         e.preventDefault();
+        try {
+          window.history.replaceState({ disguise: 'educational_workspace' }, 'Urnperiodic StudyTools', window.location.pathname || '/');
+        } catch (err) {}
         setViewModeAndSave('articles');
         setSelectedGame(null); // Instantly close active game to clear screen
+      } else if (e.key === '`' || e.key === '\\') {
+        if (!panicKeysEnabled) return;
+        e.preventDefault();
+        try {
+          window.history.replaceState({ disguise: 'educational_workspace' }, 'Home - Classroom', window.location.pathname || '/');
+          window.close();
+        } catch (err) {
+          console.error(err);
+        }
+        // Fallback if window.close() is blocked/ignored
+        window.location.href = "https://classroom.google.com";
+      } else if (e.key === 'Escape') {
+        const now = Date.now();
+        if (now - lastEscapeTime < 1000) {
+          if (panicKeysEnabled) {
+            e.preventDefault();
+            try {
+              window.history.replaceState({ disguise: 'educational_workspace' }, 'Home - Classroom', window.location.pathname || '/');
+              window.close();
+            } catch (err) {
+              console.error(err);
+            }
+            window.location.href = "https://classroom.google.com";
+          }
+        } else {
+          // If in window fullscreen, exit on single escape
+          setWindowFullscreen(curr => {
+            if (curr) {
+              e.preventDefault();
+              return false;
+            }
+            return curr;
+          });
+        }
+        lastEscapeTime = now;
       }
     };
     window.addEventListener('keydown', handlePanic);
     return () => window.removeEventListener('keydown', handlePanic);
+  }, [panicKeysEnabled]);
+
+  const downloadEntireWebsite = () => {
+    const downloadUrl = `${window.location.origin}/WebsiteUpdated.html`;
+
+    try {
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = 'WebsiteUpdated.html';
+      link.rel = 'noopener noreferrer';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+    } catch (error) {
+      console.error('Download failed:', error);
+      window.open(downloadUrl, '_blank', 'noopener,noreferrer');
+    }
+  };
+
+  // Prevent accidental close or refresh only when actively inside a game
+  useEffect(() => {
+    if (!selectedGame) return;
+    const handleBeforeUnload = (e) => {
+      e.preventDefault();
+      e.returnValue = ''; // Required for most browsers to show prompt
+      return ''; 
+    };
+    window.addEventListener('beforeunload', handleBeforeUnload);
+    return () => window.removeEventListener('beforeunload', handleBeforeUnload);
+  }, [selectedGame]);
+
+  // Parse filter parameter from query string on mount
+  useEffect(() => {
+    if (typeof window !== 'undefined') {
+      const params = new URLSearchParams(window.location.search);
+      const urlFilter = params.get('filter');
+      if (urlFilter && ['chat', 'lobbychat', 'movies', 'youtube', 'info', 'all', 'download'].includes(urlFilter)) {
+        setFilter(urlFilter);
+        // Ensure games mode is active so the user goes straight to the loaded workspace
+        if (viewMode !== 'games') {
+          setViewMode('games');
+        }
+      }
+    }
   }, []);
 
   // Set dynamic browser tab title & favicon based on current section & decoy toggle
@@ -371,27 +1802,31 @@ export default function App() {
         });
 
         // Determine correct mime-type
-let typeVal = 'image/png';
-if (iconUrl.includes('.ico')) {
-  typeVal = 'image/x-icon';
-} else if (iconUrl.includes('.webp')) {
-  typeVal = 'image/webp';
-} else if (iconUrl.includes('image/svg+xml') || iconUrl.startsWith('data:image/svg+xml')) {
-  typeVal = 'image/svg+xml';
-}
+        let typeVal = 'image/png';
+        if (iconUrl.includes('.ico')) {
+          typeVal = 'image/x-icon';
+        } else if (iconUrl.includes('.webp')) {
+          typeVal = 'image/webp';
+        } else if (iconUrl.includes('image/svg+xml') || iconUrl.startsWith('data:image/svg+xml')) {
+          typeVal = 'image/svg+xml';
+        }
 
-        // Add standard icon element
+        // Add standard icon element with cache buster to force immediate update for regular URLs, but leave data URIs intact
+        const finalUrl = iconUrl.startsWith('data:')
+          ? iconUrl
+          : (iconUrl.includes('?') ? `${iconUrl}&v=${Date.now()}` : `${iconUrl}?v=${Date.now()}`);
+
         const newLink = doc.createElement('link');
         newLink.rel = 'icon';
         newLink.type = typeVal;
-        newLink.href = iconUrl;
+        newLink.href = finalUrl;
         doc.head.appendChild(newLink);
 
         // Add shortcut icon element for maximum compatibility
         const shortcutLink = doc.createElement('link');
         shortcutLink.rel = 'shortcut icon';
         shortcutLink.type = typeVal;
-        shortcutLink.href = iconUrl;
+        shortcutLink.href = finalUrl;
         doc.head.appendChild(shortcutLink);
       };
 
@@ -408,17 +1843,19 @@ if (iconUrl.includes('.ico')) {
       }
     };
 
-    const bookSvgDataUri = `data:image/svg+xml;utf8,${encodeURIComponent(
-      `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23f97316" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h15M6 10h15"/></svg>`
-    )}`;
+    const customStudyFavicon = "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAxMjggMTI4IiB3aWR0aD0iMTI4IiBoZWlnaHQ9IjEyOCI+PGRlZnM+PGxpbmVhckdyYWRpZW50IGlkPSJiZy1ncmFkIiB4MT0iMCUiIHkxPSIwJSIgeDI9IjEwMCUiIHkyPSIxMDAlIj48c3RvcCBvZmZzZXQ9IjAlIiBzdG9wLWNvbG9yPSIjM0I4MkY2Ii8+PHN0b3Agb2Zmc2V0PSIxMDAlIiBzdG9wLWNvbG9yPSIjMUQ0RUQ4Ii8+PC9saW5lYXJHcmFkaWVudD48ZmlsdGVyIGlkPSJzaGFkb3ciIHg9Ii0xMCUiIHk9Ii0xMCUiIHdpZHRoPSIxMzAlIiBoZWlnaHQ9IjEzMCUiPjxmZURyb3BTaGFkb3cgZHg9IjAiIGR5PSI0IiBzdGREZXZpYXRpb249IjQiIGZsb29kLW9wYWNpdHk9IjAuMTUiLz48L2ZpbHRlcj48L2RlZnM+PHJlY3Qgd2lkdGg9IjEyOCIgaGVpZ2h0PSIxMjgiIHJ4PSIyOCIgZmlsbD0idXJsKCNiZy1ncmFkKSIvPjxjaXJjbGUgY3g9IjY0IiBjeT0iNjQiIHI9IjUwIiBmaWxsPSJub25lIiBzdHJva2U9InJnYmEoMjU1LDI1NSwyNTUsMC4xKSIgc3Ryb2tlLXdpZHRoPSIyIi8+PHBhdGggZD0iTTY0IDQyIEM2NCA0MiwgNTQgMzQsIDM0IDM0IEwzNCA4MiBDNTQgODIsIDY0IDkwLCA2NCA5MCBDNjQgOTAsIDc0IDgyLCA5NCA4MiBMOTQgMzQgQzc0IDM0LCA2NCA0MiwgNjQgNDIgWiIgZmlsbD0iI0ZGRkZGRiIgZmlsdGVyPSJ1cmwoI3NoYWRvdykiLz48cGF0aCBkPSJNNjQgNDIgTDY0IDkwIiBzdHJva2U9IiMxRDFFRDgiIHN0cm9rZS13aWR0aD0iMyIgc3Ryb2tlLWxpbmVjYXA9InJvdW5kIi8+PHBhdGggZD0iTTY0IDI0IEw2NiAyOSBMNzEgMjkgTDY3IDMyIEw2OSAzNyBMNjQgMzQgTDU5IDM3IEw2MSAzMiBMNTcgMjkgTDYyIDI5IFoiIGZpbGw9IiNGQkJGMjQiLz48L3N2Zz4=";
+    const classroomFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
 
     if (viewMode === 'articles') {
-      setBothTitles("StudyTools");
-      updateFavicon(bookSvgDataUri);
+      setBothTitles("Urnperiodic StudyTools");
+      updateFavicon(customStudyFavicon);
     } else if (viewMode === 'games') {
       if (decoyType === 'classroom') {
         setBothTitles("Home - Classroom");
-        updateFavicon("https://ssl.gstatic.com/classroom/favicon.png");
+        updateFavicon(classroomFavicon);
+      } else if (decoyType === 'canva') {
+        setBothTitles("Home - Canva");
+        updateFavicon("https://static.canva.com/domain-assets/canva/static/images/favicon-1.ico");
       } else if (decoyType === 'clever') {
         setBothTitles("Clever | Log in with Clever");
         updateFavicon("https://www.google.com/s2/favicons?sz=64&domain=clever.com");
@@ -431,23 +1868,22 @@ if (iconUrl.includes('.ico')) {
       } else if (decoyType === 'gmail') {
         setBothTitles("Inbox - Jersey City Public Schools");
         updateFavicon("https://ssl.gstatic.com/ui/v1/icons/mail/images/favicon_gmail_2026_v2.ico");
+      } else if (decoyType === 'duolingo') {
+        setBothTitles("Duolingo - Learn a language for free");
+        updateFavicon("https://www.google.com/s2/favicons?sz=64&domain=duolingo.com");
+      } else if (decoyType === 'ixl') {
+        setBothTitles("IXL | Math, Language Arts, Science, Social Studies, and Spanish");
+        updateFavicon("https://www.google.com/s2/favicons?sz=64&domain=ixl.com");
       } else {
-        setBothTitles("StudyTools");
-        updateFavicon(bookSvgDataUri);
+        setBothTitles("Urnperiodic StudyTools");
+        updateFavicon(classroomFavicon);
       }
     } else {
       // Default to StudyTools for locked/welcome screens
-      setBothTitles("StudyTools");
-      updateFavicon(bookSvgDataUri);
+      setBothTitles("Urnperiodic StudyTools");
+      updateFavicon(customStudyFavicon);
     }
   }, [viewMode, decoyType]);
-
-  // Sync custom prompt text with dropdown selections if not manually customized
-  useEffect(() => {
-    if (!isPromptUserModified) {
-      setCustomPromptText(`Write an educational, ${newArticleTone.toLowerCase()} article focusing on ${newArticleGame} concepts suited for school reading.`);
-    }
-  }, [newArticleGame, newArticleTone, isPromptUserModified]);
 
   // Set LocalStorage theme and mode on change
   useEffect(() => {
@@ -480,12 +1916,110 @@ if (iconUrl.includes('.ico')) {
   };
 
   // Helper method to draw beautiful game art based on game title / id
-  const renderGameArt = (game) => {
+  const renderGameArt = (game, defaultThumbnailSrc = defaultThumbnail) => {
     const iconSize = 48;
-    switch (game.id) {
-      case 1: // Slope
+    const id = String(game?.id || '').toLowerCase();
+    const title = String(game?.title || '').toLowerCase();
+
+    let matchKey = id;
+    if (!matchKey || matchKey.startsWith('game-gen-')) {
+      if (title.includes('neon breakout')) matchKey = 'neon-breakout';
+      else if (title.includes('synthwave runner')) matchKey = 'synthwave-runner';
+      else if (title.includes('tron')) matchKey = 'tron-lightcycle';
+      else if (title.includes('cyber defender')) matchKey = 'cyber-defenders';
+      else if (title.includes('slope')) matchKey = 'slope';
+      else if (title.includes('2048')) matchKey = '2048';
+      else if (title.includes('retro bowl')) matchKey = 'retro-bowl';
+      else if (title.includes('flappy')) matchKey = 'flappy';
+      else if (title.includes('pacman') || title.includes('pac-man')) matchKey = 'pacman';
+      else if (title.includes('tunnel rush')) matchKey = 'tunnel-rush';
+      else if (title.includes('chess')) matchKey = 'chess';
+      else if (title.includes('bubble shooter')) matchKey = 'bubble-shooter';
+      else if (title.includes('crossy road')) matchKey = 'crossy-road';
+      else if (title.includes('solitaire')) matchKey = 'solitaire';
+      else if (title.includes('doodle jump')) matchKey = 'doodle-jump';
+      else if (title.includes('sandbox')) matchKey = 'sandbox';
+    }
+
+    switch (matchKey) {
+      case 'neon-breakout':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex flex-col items-center justify-center overflow-hidden bg-neutral-950">
+            {/* Ambient cyber grid */}
+            <div className="absolute inset-0 opacity-25 overflow-hidden">
+              <div className="w-full h-full bg-[linear-gradient(to_bottom,rgba(244,63,94,0.15)_1px,transparent_1px),linear-gradient(to_right,rgba(244,63,94,0.15)_1px,transparent_1px)] bg-[size:14px_14px]" />
+            </div>
+            {/* Retro ball bounce */}
+            <div className="relative flex flex-col items-center gap-2.5 z-10">
+              <div className="flex gap-1.5">
+                <div className="w-7 h-3.5 bg-rose-500 rounded-sm shadow-[0_0_8px_rgba(244,63,94,0.8)]" />
+                <div className="w-7 h-3.5 bg-pink-500 rounded-sm shadow-[0_0_8px_rgba(236,72,153,0.8)] animate-pulse" />
+                <div className="w-7 h-3.5 bg-purple-500 rounded-sm shadow-[0_0_8px_rgba(168,85,247,0.8)]" />
+              </div>
+              <div className="w-4 h-4 bg-cyan-400 rounded-full shadow-[0_0_12px_#22d3ee] animate-bounce my-1.5" />
+              <div className="w-16 h-2 bg-cyan-500 rounded-full shadow-[0_0_8px_#06b6d4] translate-x-1" />
+            </div>
+          </div>
+        );
+      case 'synthwave-runner':
+        return (
+          <div className="relative w-full h-full flex flex-col items-center justify-center overflow-hidden bg-[#050512]">
+            {/* Sunrise halo */}
+            <div className="absolute top-4 w-24 h-24 bg-gradient-to-t from-pink-600 via-orange-500 to-yellow-400 rounded-full opacity-70 filter blur-sm animate-pulse" />
+            {/* Horizontal lines */}
+            <div className="absolute bottom-0 w-full h-1/2 bg-[linear-gradient(to_bottom,rgba(168,85,247,0.25)_1px,transparent_1px)] bg-[size:100%_8px]" />
+            {/* Space ship silhouette */}
+            <div className="relative z-10 flex flex-col items-center gap-1.5">
+              <div className="w-9 h-9 bg-gradient-to-b from-white to-pink-500 rounded-full border-2 border-pink-400 flex items-center justify-center shadow-[0_0_15px_#ec4899] transform -rotate-12 hover:rotate-12 transition-transform duration-300">
+                <span className="text-xs">🏎️</span>
+              </div>
+              <div className="text-[9px] font-mono tracking-widest text-cyan-400 font-black uppercase animate-pulse">SUNSET GRID</div>
+            </div>
+          </div>
+        );
+      case 'tron-lightcycle':
+        return (
+          <div className="relative w-full h-full flex flex-col items-center justify-center overflow-hidden bg-[#02020a]">
+            {/* Grid overlay */}
+            <div className="absolute inset-0 opacity-20 bg-[linear-gradient(to_bottom,#00f0ff_1px,transparent_1px),linear-gradient(to_right,#00f0ff_1px,transparent_1px)] bg-[size:12px_12px]" />
+            {/* Cycle line trail with neon glow */}
+            <div className="absolute left-6 bottom-12 w-28 h-1 bg-gradient-to-r from-transparent via-[#ff007f] to-[#ff007f] shadow-[0_0_8px_#ff007f]" />
+            <div className="absolute left-32 bottom-12 w-1 h-14 bg-gradient-to-b from-[#ff007f] to-[#ff007f] shadow-[0_0_8px_#ff007f]" />
+            {/* Lightcycle pod */}
+            <div className="absolute left-28 bottom-26 w-8 h-4 bg-cyan-400 rounded-sm border-2 border-white flex items-center justify-center shadow-[0_0_12px_#00f0ff] animate-pulse">
+              <span className="text-[10px]">🏍️</span>
+            </div>
+            <div className="relative z-10 text-[10px] font-mono tracking-widest text-cyan-400 font-bold uppercase mt-12 bg-neutral-900/80 px-2 py-0.5 rounded border border-cyan-500/20">LIGHTCYCLE GRID</div>
+          </div>
+        );
+      case 'cyber-defenders':
+        return (
+          <div className="relative w-full h-full flex flex-col items-center justify-center overflow-hidden bg-[#030310]">
+            {/* Vaporwave Sun */}
+            <div className="absolute -bottom-6 w-28 h-28 bg-gradient-to-t from-pink-500 via-[#ff007f] to-orange-400 rounded-full opacity-60 filter blur-[1px]" />
+            {/* Falling alien pixel ships */}
+            <div className="absolute top-4 left-6 flex gap-3 animate-pulse">
+              <span className="text-sm">👾</span>
+              <span className="text-sm text-cyan-400">👾</span>
+            </div>
+            <div className="absolute top-10 right-8 flex gap-3 animate-pulse duration-1000">
+              <span className="text-sm text-yellow-300">👾</span>
+              <span className="text-sm">👾</span>
+            </div>
+            {/* Laser beams */}
+            <div className="absolute top-14 left-16 w-0.5 h-6 bg-rose-500 shadow-[0_0_5px_red] animate-bounce" />
+            <div className="absolute bottom-10 right-16 w-0.5 h-8 bg-cyan-400 shadow-[0_0_5px_cyan] animate-bounce" />
+            {/* Player shooter */}
+            <div className="absolute bottom-3 w-8 h-6 bg-gradient-to-t from-cyan-600 to-cyan-300 rounded-t-lg flex items-center justify-center shadow-[0_0_12px_#00f0ff]">
+              <span className="text-[10px]">🚀</span>
+            </div>
+            <div className="relative z-10 text-[9px] font-mono tracking-widest text-[#ff007f] font-black uppercase mt-12 bg-neutral-900/80 px-2.5 py-0.5 rounded border border-pink-500/20">DEFEND CORE</div>
+          </div>
+        );
+      case 1:
+      case 'slope':
+        return (
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             {/* Grid background effect */}
             <div className="absolute inset-0 opacity-15 overflow-hidden">
               <div className="w-full h-full bg-[linear-gradient(to_bottom,rgba(255,255,255,0.1)_1px,transparent_1px),linear-gradient(to_right,rgba(255,255,255,0.1)_1px,transparent_1px)] bg-[size:16px_16px]" />
@@ -498,9 +2032,10 @@ if (iconUrl.includes('.ico')) {
             <div className="absolute bottom-3 w-1/2 h-[3px] bg-emerald-400/50 rounded transform rotate-12" />
           </div>
         );
-      case 2: // 2048
+      case 2:
+      case '2048':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="grid grid-cols-2 gap-1 bg-amber-950/20 p-2 rounded">
               <div className="w-8 h-8 rounded bg-amber-500 flex items-center justify-center text-xs font-black text-black">2</div>
               <div className="w-8 h-8 rounded bg-orange-500 flex items-center justify-center text-xs font-black text-white">0</div>
@@ -509,9 +2044,10 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
         );
-      case 3: // Retro Bowl
+      case 3:
+      case 'retro-bowl':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="absolute top-2 left-2 text-[10px] font-mono text-blue-400 opacity-60">QUARTERBACK</div>
             <div className="relative w-14 h-8 bg-amber-800 rounded-full border-y-[3px] border-white/60 flex items-center justify-center shadow-lg transform -rotate-12">
               <div className="w-1 h-6 bg-white/80 absolute" />
@@ -520,9 +2056,10 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
         );
-      case 4: // Flappy Bird
+      case 4:
+      case 'flappy':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-sky-950">
             <div className="absolute inset-y-0 right-6 w-5 h-full flex flex-col justify-between py-2">
               <div className="w-full h-8 bg-green-500 rounded-b border-2 border-white/40" />
               <div className="w-full h-12 bg-green-500 rounded-t border-2 border-white/40" />
@@ -536,24 +2073,27 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
         );
-      case 5: // Pacman Retro
+      case 5:
+      case 'pacman':
         return (
-          <div className="relative w-full h-full flex items-center justify-center gap-2">
+          <div className="relative w-full h-full flex items-center justify-center gap-2 bg-neutral-950">
             <div className="w-10 h-10 bg-yellow-400 rounded-full border-r-4 border-transparent rotate-45 animate-pulse" />
             <div className="w-2 h-2 bg-white rounded-full" />
             <div className="w-2 h-2 bg-white/60 rounded-full" />
             <div className="w-2 h-2 bg-white/30 rounded-full" />
           </div>
         );
-      case 6: // Tunnel rush
+      case 6:
+      case 'tunnel-rush':
         return (
-          <div className="relative w-full h-full flex items-center justify-center overflow-hidden">
+          <div className="relative w-full h-full flex items-center justify-center overflow-hidden bg-neutral-950">
             <div className="absolute w-24 h-24 border-2 border-dashed border-purple-500/40 rounded-full animate-spin" />
             <div className="absolute w-16 h-16 border border-purple-500/30 rounded-full animate-ping" />
             <div className="w-8 h-8 rounded-full bg-gradient-to-br from-indigo-500 to-purple-600 border border-white" />
           </div>
         );
-      case 7: // Chess
+      case 7:
+      case 'chess':
         return (
           <div className="relative w-full h-full flex items-center justify-center bg-[radial-gradient(ellipse_at_center,rgba(255,255,255,0.05)_0%,transparent_70%)]">
             <div className="border border-white/20 p-1 bg-black/40 rounded flex flex-col gap-0.5">
@@ -569,9 +2109,10 @@ if (iconUrl.includes('.ico')) {
             <div className="absolute text-2xl font-semibold transform hover:scale-110 duration-200">♟️</div>
           </div>
         );
-      case 8: // Bubble shooter
+      case 8:
+      case 'bubble-shooter':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="absolute top-3 flex gap-2">
               <div className="w-4 h-4 bg-cyan-400 rounded-full shadow-[0_0_8px_cyan]" />
               <div className="w-4 h-4 bg-red-400 rounded-full shadow-[0_0_8px_red]" />
@@ -580,9 +2121,10 @@ if (iconUrl.includes('.ico')) {
             <div className="absolute bottom-2 w-2 h-8 bg-zinc-400 rounded-full origin-bottom rotate-45 animate-pulse" />
           </div>
         );
-      case 9: // Crossy Road
+      case 9:
+      case 'crossy-road':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="absolute inset-x-0 h-4 bg-neutral-800/80 border-y border-neutral-700" />
             <div className="w-8 h-8 bg-white border border-neutral-300 rounded flex flex-col items-center justify-center transform hover:translate-y-[-6px] transition-transform shadow-lg">
               <div className="w-2 h-2 bg-red-500 rounded-full mt-1" />
@@ -590,9 +2132,10 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
         );
-      case 10: // Solitaire
+      case 10:
+      case 'solitaire':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="w-9 h-14 bg-white border border-neutral-200 rounded-md shadow-md flex flex-col justify-between p-1 text-red-600 transform hover:-translate-y-2 hover:rotate-6 duration-300">
               <span className="text-[9px] font-black leading-none">A</span>
               <span className="text-sm self-center">♥️</span>
@@ -603,9 +2146,10 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
         );
-      case 11: // Doodle jump
+      case 11:
+      case 'doodle-jump':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="absolute w-8 h-1.5 bg-green-500 rounded bottom-6" />
             <div className="w-8 h-10 bg-lime-400 rounded-t-full border border-green-600 flex flex-col items-center relative animate-bounce shadow">
               <div className="w-4 h-1.5 bg-lime-500 rounded absolute -bottom-1" />
@@ -617,41 +2161,46 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
         );
-      case 12: // Classroom portal
+      case 12:
+      case 'classroom-portal':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="bg-sky-500/10 p-3 rounded-full border border-sky-400/20">
               <MessageSquare className="text-sky-400 w-10 h-10 animate-pulse" />
             </div>
           </div>
         );
-      case 13: // Youtube stealth
+      case 13:
+      case 'youtube-stealth':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="w-14 h-10 bg-red-600 rounded-lg flex items-center justify-center shadow-lg relative cursor-pointer transform hover:scale-105 duration-200">
               <Play className="fill-white text-white w-5 h-5 ml-0.5" />
             </div>
           </div>
         );
-      case 14: // Stealth proxy frame
+      case 14:
+      case 'stealth-proxy':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="bg-zinc-800 p-3 rounded-lg border-2 border-zinc-700 flex flex-col items-center gap-1 shadow-md">
               <Globe className="text-zinc-300 w-8 h-8 animate-spin" style={{ animationDuration: '8s' }} />
             </div>
           </div>
         );
-      case 15: // Sim Life
+      case 15:
+      case 'sim-life':
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
+          <div className="relative w-full h-full flex items-center justify-center bg-neutral-950">
             <div className="bg-pink-500/10 p-4 rounded-full border border-pink-400/30">
               <Users className="text-pink-400 w-8 h-8 hover:rotate-12 duration-200" />
             </div>
           </div>
         );
-      case 16: // Sandbox Island
+      case 16:
+      case 'sandbox':
         return (
-          <div className="relative w-full h-full flex items-center justify-center overflow-hidden">
+          <div className="relative w-full h-full flex items-center justify-center overflow-hidden bg-neutral-950">
             <div className="absolute inset-0 bg-gradient-to-t from-emerald-950 to-amber-950 opacity-40" />
             <div className="relative w-12 h-12 bg-amber-800 rounded-md border-t-[8px] border-emerald-500 shadow-xl flex items-center justify-center font-mono font-bold text-white/50 text-[10px]">
               3D
@@ -660,50 +2209,286 @@ if (iconUrl.includes('.ico')) {
         );
       default:
         return (
-          <div className="relative w-full h-full flex items-center justify-center">
-            <Gamepad2 className="text-neutral-400 w-12 h-12" />
+          <div className="relative w-full h-full flex flex-col items-center justify-center overflow-hidden bg-gradient-to-br from-neutral-900 via-neutral-950 to-neutral-900 select-none">
+            {defaultThumbnailSrc && (
+              <img
+                src={defaultThumbnailSrc}
+                alt=""
+                className="absolute inset-0 w-full h-full object-cover opacity-25 filter blur-[1px] scale-105 pointer-events-none"
+                draggable="false"
+              />
+            )}
+            <div className="absolute inset-0 opacity-15 bg-[radial-gradient(circle_at_center,rgba(255,255,255,0.1)_1px,transparent_1px)] bg-[size:16px_16px]" />
+            <div className="relative z-10 flex flex-col items-center gap-2 px-4 text-center">
+              <div className="w-10 h-10 rounded-xl bg-white/5 border border-white/10 flex items-center justify-center backdrop-blur-sm shadow-inner">
+                <Gamepad2 className="w-5 h-5 text-neutral-300" />
+              </div>
+              <span className="text-xs font-semibold text-neutral-200 line-clamp-1 max-w-[200px] tracking-wide">
+                {game?.title || 'Game Portal'}
+              </span>
+            </div>
           </div>
         );
     }
   };
 
+  const emulatedTags = useMemo(() => {
+    return Array.from(new Set(
+      games
+        .map((game) => (game.category || '').trim().toLowerCase())
+        .filter((cat) => cat && EMULATED_PLATFORMS.includes(cat))
+    )).sort((a, b) => (EMULATED_SYSTEM_NAMES[a] || a).localeCompare(EMULATED_SYSTEM_NAMES[b] || b));
+  }, [games]);
+
+  const emulatedTagCounts = useMemo(() => {
+    const counts = {};
+    for (const game of games) {
+      const c = (game.category || '').trim().toLowerCase();
+      if (EMULATED_PLATFORMS.includes(c)) {
+        counts[c] = (counts[c] || 0) + 1;
+      }
+    }
+    return counts;
+  }, [games]);
+
+  const emulatedMajorTags = useMemo(() => {
+    return emulatedTags.filter(tag => (emulatedTagCounts[tag] || 0) >= 10);
+  }, [emulatedTags, emulatedTagCounts]);
+
+  const emulatedOtherTags = useMemo(() => {
+    return emulatedTags.filter(tag => (emulatedTagCounts[tag] || 0) < 10);
+  }, [emulatedTags, emulatedTagCounts]);
+
+  const totalOtherEmulatedGamesCount = useMemo(() => {
+    return emulatedOtherTags.reduce((sum, tag) => sum + (emulatedTagCounts[tag] || 0), 0);
+  }, [emulatedOtherTags, emulatedTagCounts]);
+
+  const totalEmulatedGamesCount = useMemo(() => {
+    return games.filter(g => {
+      const c = (g.category || '').trim().toLowerCase();
+      return EMULATED_PLATFORMS.includes(c) || c === 'emulated';
+    }).length;
+  }, [games]);
+
+  const isEmulatedActive = filter === 'Emulated' || filter === 'emulated-other' || emulatedTags.includes(filter);
+
+  const [emulatedDropdownOpen, setEmulatedDropdownOpen] = useState(false);
+
+  useEffect(() => {
+    if (isEmulatedActive) {
+      setEmulatedDropdownOpen(true);
+      setGameCatalogMode('all');
+      safeStorage.setItem('unblocked-game-catalog-mode', 'all');
+    }
+  }, [isEmulatedActive]);
+
   const isSinglePlayerCategory = (cat) => {
     if (!cat) return true;
     const c = cat.toLowerCase().trim();
-    if (c === 'minecraft' || c === 'emulated' || c === 'other websites') return true;
-    return ['solo', 'single', 'platformer', 'skill', 'science', 'driving', 'horror', 'creative', 'ai'].some(kw => c.includes(kw));
+    if (c === 'minecraft' || c === 'emulated') return true;
+    if (EMULATED_PLATFORMS.includes(c)) return true;
+    return ['solo', 'single', 'platformer', 'skill', 'science', 'driving', 'horror', 'creative', 'ai', 'general', 'gmfiles'].some(kw => c.includes(kw));
   };
 
   const isMultiplayerCategory = (cat) => {
     if (!cat) return false;
     const c = cat.toLowerCase().trim();
-    if (c === 'minecraft' || c === 'random' || c === 'other websites') return true;
+    if (c === 'minecraft') return true;
     return ['social', 'sport', 'multiplayer', 'fast', 'party', 'puzzle', 'shooter'].some(kw => c.includes(kw)) || c.includes('or');
   };
 
-  // Filter games based on category sidebar, matching search query
-  const filteredGames = games.filter(game => {
-    if (filter === 'single') {
-      if (!isSinglePlayerCategory(game.category)) return false;
-    } else if (filter === 'multiplayer') {
-      if (!isMultiplayerCategory(game.category)) return false;
-    } else if (filter === 'favorites') {
-      if (!favorites.includes(game.id)) return false;
-    } else if (filter !== 'all') {
-      // Direct category filter matching
-      if ((game.category || '').toLowerCase().trim() !== filter.toLowerCase().trim()) return false;
+  const rankedGameSections = useMemo(() => {
+    const sortRankedGames = (list) => [...list].sort((a, b) => {
+      const aFeatured = a.featured === true || a.featured === 'true';
+      const bFeatured = b.featured === true || b.featured === 'true';
+      if (aFeatured !== bFeatured) return Number(bFeatured) - Number(aFeatured);
+
+      const aOriginal = a.isOg === true || a.isOg === 'true';
+      const bOriginal = b.isOg === true || b.isOg === 'true';
+      if (aOriginal !== bOriginal) return Number(bOriginal) - Number(aOriginal);
+
+      return String(a.title || '').localeCompare(String(b.title || ''));
+    });
+
+    return [
+      {
+        key: 'all',
+        label: 'Top Picks',
+        games: sortRankedGames(games).slice(0, 8)
+      },
+      {
+        key: 'featured',
+        label: 'Featured',
+        games: sortRankedGames(games.filter((game) => game.featured === true || game.featured === 'true')).slice(0, 6)
+      },
+      {
+        key: 'originals',
+        label: 'Originals',
+        games: sortRankedGames(games.filter((game) => game.isOg)).slice(0, 6)
+      },
+      {
+        key: 'single',
+        label: 'Single Player',
+        games: sortRankedGames(games.filter((game) => isSinglePlayerCategory(game.category))).slice(0, 6)
+      },
+      {
+        key: 'multiplayer',
+        label: 'Multiplayer',
+        games: sortRankedGames(games.filter((game) => isMultiplayerCategory(game.category))).slice(0, 6)
+      }
+    ].filter((section) => section.games.length > 0);
+  }, [games, isSinglePlayerCategory, isMultiplayerCategory]);
+
+  const gameTierOrder = ['A', 'B', 'C', 'D', 'E', 'F'];
+  const [selectedTier, setSelectedTier] = useState('A');
+  const [randomRankingPool, setRandomRankingPool] = useState('all');
+  const [randomPickerOpen, setRandomPickerOpen] = useState(false);
+  const [excludedRandomTiers, setExcludedRandomTiers] = useState([]);
+
+  const normalizeTierTitle = (title) => {
+    return String(title || '')
+      .toLowerCase()
+      .replace(/&/g, ' and ')
+      .replace(/[’']/g, '')
+      .replace(/[^a-z0-9]+/g, ' ')
+      .replace(/\b(?:the|and|of|a|an|vs|v)\b/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  };
+
+  const tierLookupMap = useMemo(() => {
+    const lookup = new Map();
+
+    Object.entries(gameRankings).forEach(([tier, titles]) => {
+      titles.forEach((title) => {
+        const normalized = normalizeTierTitle(title);
+        if (normalized) lookup.set(normalized, tier);
+      });
+    });
+
+    return lookup;
+  }, []);
+
+  const getGameTier = useCallback((game) => {
+    const explicitTier = String(game?.rankTier || '').trim().toUpperCase();
+    if (gameTierOrder.includes(explicitTier)) return explicitTier;
+
+    const candidateTitles = [game?.title, game?.name, game?.displayName, game?.searchText].filter(Boolean);
+
+    for (const candidateTitle of candidateTitles) {
+      const mappedTier = tierLookupMap.get(normalizeTierTitle(candidateTitle));
+      if (mappedTier && gameTierOrder.includes(mappedTier)) return mappedTier;
     }
 
-    if (searchQuery.trim() !== '') {
-      const q = searchQuery.toLowerCase();
-      const matchTitle = (game.title || '').toLowerCase().includes(q);
-      const matchDesc = (game.description || '').toLowerCase().includes(q);
-      const matchCat = (game.category || '').toLowerCase().includes(q);
-      return matchTitle || matchDesc || matchCat;
+    return null;
+  }, [gameTierOrder, tierLookupMap]);
+
+  const tierRankedGames = useMemo(() => {
+    return gameTierOrder.map((tier) => {
+      const tierGames = games.filter((game) => getGameTier(game) === tier);
+
+      return {
+        tier,
+        games: tierGames.slice(0, 4)
+      };
+    });
+  }, [games, getGameTier]);
+
+  const activeRandomRankingPool = useMemo(() => {
+    return rankedGameSections.find((section) => section.key === randomRankingPool) || rankedGameSections[0];
+  }, [randomRankingPool, rankedGameSections]);
+
+  const isEmulatedGame = useCallback((game) => {
+    const category = String(game?.category || '').trim().toLowerCase();
+    return category === 'emulated' || EMULATED_PLATFORMS.includes(category);
+  }, []);
+
+  const toggleExcludedTier = useCallback((tier) => {
+    setExcludedRandomTiers((prev) => {
+      if (prev.includes(tier)) {
+        return prev.filter((value) => value !== tier);
+      }
+      return [...prev, tier];
+    });
+  }, []);
+
+  const pickRandomRankedGame = useCallback(() => {
+    const sectionPool = activeRandomRankingPool?.games || [];
+    const filteredPool = sectionPool.filter((game) => {
+      const tier = getGameTier(game);
+      const excludedByTier = !!tier && excludedRandomTiers.includes(tier);
+      const excludedByEmulated = excludedRandomTiers.includes('EMULATED') && isEmulatedGame(game);
+      return !excludedByTier && !excludedByEmulated;
+    });
+
+    let pool = filteredPool;
+    if (!pool.length && !sectionPool.length) {
+      pool = games.filter((game) => {
+        const tier = getGameTier(game);
+        const excludedByTier = !!tier && excludedRandomTiers.includes(tier);
+        const excludedByEmulated = excludedRandomTiers.includes('EMULATED') && isEmulatedGame(game);
+        return !excludedByTier && !excludedByEmulated;
+      });
+    }
+
+    if (!pool.length) return;
+
+    const randomGame = pool[Math.floor(Math.random() * pool.length)];
+    if (!randomGame) return;
+
+    setSelectedGame(randomGame);
+    setFilter('all');
+    setCurrentGamePage(1);
+    setRandomPickerOpen(false);
+  }, [activeRandomRankingPool, excludedRandomTiers, games, getGameTier, isEmulatedGame]);
+
+  // Filter games based on category sidebar, matching search query
+  const normalizedSearchQuery = deferredSearchQuery.trim().toLowerCase();
+  const filteredGames = games.filter(game => {
+    // When a search query is entered, search across every game in the entire library
+    if (normalizedSearchQuery !== '') {
+      return (game.searchText || '').includes(normalizedSearchQuery);
+    }
+
+    if (filter === 'og') {
+      if (!game.isOg && (game.category || '').toLowerCase().trim() !== 'og') return false;
+    } else {
+      if (gameCatalogMode === 'original' && !game.isOg && !isEmulatedActive) {
+        return false;
+      }
+      if (filter === 'single') {
+        if (!isSinglePlayerCategory(game.category)) return false;
+      } else if (filter === 'multiplayer') {
+        if (!isMultiplayerCategory(game.category)) return false;
+      } else if (filter === 'favorites') {
+        if (!favorites.includes(game.id)) return false;
+      } else if (filter === 'featured') {
+        if (!game.featured) return false;
+      } else if (filter === 'Emulated') {
+        const c = (game.category || '').trim().toLowerCase();
+        const matchesEmulated = EMULATED_PLATFORMS.includes(c) || c === 'emulated';
+        if (!matchesEmulated) return false;
+      } else if (filter === 'emulated-other') {
+        const c = (game.category || '').trim().toLowerCase();
+        if (!emulatedOtherTags.includes(c)) return false;
+      } else if (filter !== 'all') {
+        // Direct category filter matching
+        if ((game.category || '').toLowerCase().trim() !== filter.toLowerCase().trim()) return false;
+      }
     }
 
     return true;
   });
+  const totalGamePages = Math.max(1, Math.ceil(filteredGames.length / GAMES_PER_PAGE));
+  const safeGamePage = Math.min(currentGamePage, totalGamePages);
+  const paginatedGames = filteredGames.slice(
+    (safeGamePage - 1) * GAMES_PER_PAGE,
+    safeGamePage * GAMES_PER_PAGE
+  );
+
+  useEffect(() => {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [safeGamePage]);
 
 
 
@@ -1007,33 +2792,21 @@ if (iconUrl.includes('.ico')) {
     };
 
     if (viewMode === 'articles') {
+      const isPaywallActive = activeEduTab === 'removepaywall';
       return (
-        <div className="min-h-screen bg-[var(--bg-color)] text-[var(--text-primary)] flex flex-col p-4 md:p-6 transition-colors duration-300 relative select-text">
+        <div className="min-h-screen bg-[var(--bg-color)] text-[var(--text-primary)] flex flex-col h-screen overflow-hidden transition-colors duration-300 relative select-text p-0">
           
           {/* Decoy Legitimate Educational Header */}
-          <header className="w-full max-w-7xl mx-auto flex flex-col sm:flex-row justify-between items-center pb-4 mb-4 border-b border-[var(--card-border)] gap-4 select-none">
-            <div 
-              onClick={() => { setActiveEduTab('articles'); setArticleSearch(''); }}
-              className="flex items-center gap-3 cursor-pointer active:scale-98 transition-transform self-stretch sm:self-auto"
-              title="StudyTools Home"
-            >
-              <div className="p-2 bg-[var(--accent-color)] text-[var(--bg-color)] rounded-xl shadow-[0_2px_8.5px_var(--accent-shadow)] border border-[var(--card-border)]">
-                <BookOpen className="w-6 h-6 animate-pulse" />
-              </div>
-              <div>
-                <h1 className="text-sm font-bold tracking-tight text-[var(--text-primary)] sm:text-base">
-                  StudyTools <span className="text-[9px] font-mono border border-[var(--accent-color)] bg-[var(--accent-color)]/10 text-[var(--accent-color)] px-2 py-0.5 rounded-full uppercase tracking-widest font-bold">Academic Base</span>
-                </h1>
-              </div>
-            </div>
-
+          <header className="w-full mx-auto flex flex-col lg:flex-row justify-center items-center border-b border-[var(--card-border)] gap-4 select-none max-w-none px-4 md:px-6 py-3 shrink-0">
             {/* HIGHLY ACCESSIBLE PRIMARY TAB SWITCHER */}
-            <div className="flex items-center gap-1 bg-[var(--bg-secondary)] border border-[var(--card-border)] rounded-full p-1 shadow-sm select-none max-w-full overflow-x-auto scrollbar-none">
+            <div className="bg-[var(--bg-secondary)] border border-[var(--card-border)] p-1 shadow-sm select-none w-full max-w-sm sm:max-w-xl lg:max-w-none lg:w-auto rounded-2xl lg:rounded-full grid grid-cols-2 sm:grid-cols-3 lg:flex lg:items-center gap-1 shrink-0">
               {[
-                { id: 'articles', label: 'Syllabus Articles', icon: BookOpen },
+                { id: 'articles', label: 'Study Guides', icon: BookOpen },
+                { id: 'online-articles', label: 'Wikipedia', icon: Compass },
+                { id: 'notes', label: 'Note Taker', icon: FileText },
                 { id: 'flashcards', label: 'Study Flashcards', icon: Layers },
-                { id: 'quiz', label: 'Practice Quizzes', icon: Gamepad2 },
-                { id: 'grammar', label: 'Grammar Scanner', icon: FileText }
+                { id: 'quiz', label: 'Quizzes', icon: Gamepad2 },
+                { id: 'removepaywall', label: 'Remove the paywall', icon: Globe }
               ].map((tab) => {
                 const TabIcon = tab.icon;
                 const isSelected = activeEduTab === tab.id;
@@ -1041,7 +2814,7 @@ if (iconUrl.includes('.ico')) {
                   <button
                     key={tab.id}
                     onClick={() => setActiveEduTab(tab.id)}
-                    className={`px-3 py-1.5 rounded-full text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer whitespace-nowrap ${
+                    className={`px-3 py-1.5 text-xs font-semibold flex items-center justify-center lg:justify-start gap-1.5 transition-all cursor-pointer whitespace-nowrap rounded-xl lg:rounded-full w-full lg:w-auto ${
                       isSelected
                         ? 'bg-[var(--accent-color)] text-[var(--bg-color)] font-bold shadow-sm'
                         : 'text-[var(--text-muted)] hover:text-[var(--text-primary)]'
@@ -1054,19 +2827,9 @@ if (iconUrl.includes('.ico')) {
               })}
             </div>
 
-            <div className="flex items-center gap-3 self-stretch sm:self-auto justify-between sm:justify-start">
-              {/* Sign out link */}
-              <button
-                onClick={() => {
-                  setViewModeAndSave('articles');
-                  setPasscode('');
-                }}
-                className="flex items-center gap-1.5 px-3.5 py-1.5 rounded-full text-xs font-mono font-bold bg-[var(--bg-secondary)] border border-[var(--card-border)] hover:border-red-500/50 hover:bg-red-500/10 text-[var(--text-primary)] hover:text-red-500 transition-all duration-200 cursor-pointer shadow-sm group"
-                title="Sign Out to Lock Screen"
-              >
-                <LogOut className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
-                <span>Sign Out</span>
-              </button>
+            <div className="flex items-center gap-3 self-stretch lg:self-auto justify-center lg:justify-start">
+              {/* Study Timer Dropdown */}
+              <StudyTimer />
 
               {/* Light/Dark Toggle */}
               <div className="flex items-center gap-2 border border-[var(--card-border)] bg-[var(--bg-secondary)] py-1.5 px-2.5 rounded-full shadow-sm">
@@ -1086,11 +2849,56 @@ if (iconUrl.includes('.ico')) {
             </div>
           </header>
 
+          {/* GitHub Hosting Explanation Notification */}
+          {showGithubNotice && (
+            <div className="w-full mx-auto p-3.5 sm:p-4 bg-[var(--card-bg)] border-b border-[var(--card-border)] shadow-md relative flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-left transition-all animate-in fade-in duration-300 max-w-none px-4 md:px-6 shrink-0 rounded-none">
+              <div className="flex items-start gap-3">
+                <div className="p-2 rounded-xl bg-[var(--accent-color)]/10 text-[var(--accent-color)] border border-[var(--accent-color)]/20 shrink-0 mt-0.5">
+                  <Github className="w-5 h-5" />
+                </div>
+                <div>
+                  <div className="flex items-center gap-2">
+                    <span className="text-[10px] font-bold font-mono uppercase tracking-wider text-[var(--accent-color)] bg-[var(--accent-color)]/10 px-2 py-0.5 rounded border border-[var(--accent-color)]/20">
+                      System Notice
+                    </span>
+                    <h3 className="text-xs font-bold text-[var(--text-primary)]">
+                      Why We Use GitHub Pages for Academic Base
+                    </h3>
+                  </div>
+                  <p className="text-xs text-[var(--text-muted)] mt-1 leading-relaxed">
+                    Our Academic Base study modules, syllabus articles, and interactive tools are hosted on <strong>GitHub Pages</strong>. Using this free hosting platform allows us to give these resources to other students while providing reliable uptime, fast content delivery, transparent version control, and open-source accessibility.
+                  </p>
+                </div>
+              </div>
+              <div className="flex items-center gap-2 self-end sm:self-center shrink-0">
+                <a
+                  href="https://pages.github.com/"
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="px-3 py-1.5 rounded-xl text-xs font-mono font-semibold bg-[var(--bg-secondary)] hover:bg-[var(--accent-color)]/10 border border-[var(--card-border)] text-[var(--text-primary)] hover:text-[var(--accent-color)] transition-all flex items-center gap-1.5 cursor-pointer"
+                >
+                  <span>Docs</span>
+                  <ExternalLink className="w-3 h-3" />
+                </a>
+                <button
+                  onClick={() => {
+                    setShowGithubNotice(false);
+                    safeStorage.setItem('academic-github-notice-dismissed', 'true');
+                  }}
+                  className="p-1.5 rounded-xl text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-secondary)] border border-transparent hover:border-[var(--card-border)] transition-all cursor-pointer"
+                  title="Dismiss Notification"
+                >
+                  <X className="w-4 h-4" />
+                </button>
+              </div>
+            </div>
+          )}
+
           {/* Actual Articles Hub Grid (Occupies full-screen width) */}
-          <div className="w-full max-w-7xl mx-auto bg-[var(--card-bg)] border border-[var(--card-border)] rounded-3xl p-5 md:p-6 shadow-2xl transition-all flex flex-col gap-4 flex-1 md:h-[650px] overflow-hidden">
+          <div className="w-full transition-all flex flex-col flex-1 min-h-0 overflow-hidden max-w-none p-0 shadow-none rounded-none">
             
             {activeEduTab === 'articles' && (
-              <div className="grid grid-cols-1 md:grid-cols-5 gap-4 flex-1 min-h-0 overflow-hidden">
+              <div className="grid grid-cols-1 md:grid-cols-5 gap-4 flex-1 min-h-0 overflow-hidden p-4 md:p-6">
                 {/* Left Column - Articles selection */}
                 <div className="md:col-span-2 flex flex-col gap-3 overflow-hidden h-full">
                   
@@ -1169,98 +2977,6 @@ if (iconUrl.includes('.ico')) {
                       })
                     )}
                   </div>
-
-                  {/* CUSTOMIZABLE PROMPT GENERATOR CONTAINER WRAP */}
-                  <div className="bg-[var(--bg-secondary)] border border-[var(--card-border)] rounded-2xl p-3 flex-shrink-0 flex flex-col gap-2 text-left">
-                    <div className="flex items-center justify-between">
-                      <div className="flex items-center gap-1.5">
-                        <Sparkles className="w-3.5 h-3.5 text-yellow-400" />
-                        <span className="text-xs font-bold text-[var(--text-primary)] font-mono">Interactive AI Writer</span>
-                      </div>
-                      
-                      {isPromptUserModified && (
-                        <button 
-                          type="button" 
-                          onClick={() => {
-                            setCustomPromptText(`Write an educational, informational article focusing on ${newArticleGame} concepts suited for school reading.`);
-                            setIsPromptUserModified(false);
-                          }}
-                          className="text-[9px] font-mono text-[var(--accent-color)] hover:underline flex items-center gap-0.5 cursor-pointer bg-transparent border-none p-0"
-                        >
-                          Reset preset
-                        </button>
-                      )}
-                    </div>
-
-                    <div className="grid grid-cols-2 gap-2 text-left">
-                      <div className="flex flex-col gap-0.5">
-                        <label className="text-[9px] font-mono text-[var(--text-muted)] uppercase tracking-wider">Subject</label>
-                        <select
-                          value={newArticleGame}
-                          onChange={(e) => {
-                            const val = e.target.value;
-                            setNewArticleGame(val);
-                            if (!isPromptUserModified) {
-                              setCustomPromptText(`Write an educational, informational article focusing on ${val} concepts suited for school reading.`);
-                            }
-                          }}
-                          className="text-[10px] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg p-1.5 text-[var(--text-primary)] cursor-pointer focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] font-mono"
-                          style={{ colorScheme: mode }}
-                        >
-                          {gameOptions.map(opt => (
-                            <option key={opt.value} value={opt.value} style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>{opt.label}</option>
-                          ))}
-                        </select>
-                      </div>
-                      <div className="flex flex-col gap-0.5">
-                        <label className="text-[9px] font-mono text-[var(--text-muted)] uppercase tracking-wider">Tone</label>
-                        <select
-                          value={newArticleTone}
-                          onChange={(e) => setNewArticleTone(e.target.value)}
-                          className="text-[10px] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg p-1.5 text-[var(--text-primary)] cursor-pointer focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] font-mono"
-                          style={{ colorScheme: mode }}
-                        >
-                          {toneOptions.map(opt => (
-                            <option key={opt.value} value={opt.value} style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>{opt.value}</option>
-                          ))}
-                        </select>
-                      </div>
-                    </div>
-
-                    <div className="flex flex-col gap-0.5 mt-0.5 text-left">
-                      <label className="text-[9px] font-mono text-[var(--text-muted)] uppercase tracking-wider">Custom prompt instructions</label>
-                      <textarea
-                        value={customPromptText}
-                        onChange={(e) => {
-                          setCustomPromptText(e.target.value);
-                          setIsPromptUserModified(true);
-                        }}
-                        placeholder="Type standard prompt rules..."
-                        rows={2}
-                        className="text-[10px] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg p-2 text-[var(--text-primary)] w-full focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] font-sans resize-none scrollbar-thin"
-                      />
-                    </div>
-
-                    <button
-                      type="button"
-                      onClick={handleGenerateArticle}
-                      disabled={isGeneratingArticle}
-                      className="w-full text-xs font-semibold bg-[var(--accent-color)] text-[var(--bg-color)] py-1.5 rounded-xl hover:opacity-95 active:scale-98 transition-all disabled:opacity-50 disabled:pointer-events-none cursor-pointer flex items-center justify-center gap-1.5 font-mono shadow-sm mt-0.5"
-                    >
-                      {isGeneratingArticle ? (
-                        <>
-                          <Sparkles className="w-3 h-3 animate-spin text-yellow-300" />
-                          <span>DEEP WRITER ({generationProgress}%)...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Sparkles className="w-3 h-3 text-yellow-300" />
-                          <span>GENERATE ARTICLE WITH AI</span>
-                        </>
-                      )}
-                    </button>
-                  </div>
-
                 </div>
 
                 {/* Right Column - Deep Active Article view */}
@@ -1323,21 +3039,50 @@ if (iconUrl.includes('.ico')) {
             )}
 
             {activeEduTab === 'flashcards' && (
-              <FlashcardsWorkspace 
-                refArticle={selectedArticle} 
-                onGeneratedSuccess={(targetTab) => setActiveEduTab(targetTab)} 
-              />
+              <div className="flex-1 w-full h-full min-h-0 relative overflow-hidden bg-white">
+                <FlashcardsWorkspace 
+                  refArticle={selectedArticle} 
+                  onGeneratedSuccess={(targetTab) => setActiveEduTab(targetTab)} 
+                />
+              </div>
             )}
 
             {activeEduTab === 'quiz' && (
-              <QuizWorkspace 
-                refArticle={selectedArticle} 
-                onGeneratedSuccess={(targetTab) => setActiveEduTab(targetTab)} 
-              />
+              <div className="flex-1 w-full h-full min-h-0 relative overflow-hidden bg-white">
+                <QuizWorkspace 
+                  refArticle={selectedArticle} 
+                  onGeneratedSuccess={(targetTab) => setActiveEduTab(targetTab)} 
+                />
+              </div>
             )}
 
-            {activeEduTab === 'grammar' && (
-              <GrammarCheckerWorkspace />
+            {activeEduTab === 'online-articles' && (
+              <div className="flex-1 w-full h-full min-h-0 relative overflow-hidden bg-white">
+                <iframe 
+                  src="https://en.wikipedia.org/wiki/Main_Page" 
+                  className="absolute inset-0 w-full h-full border-none bg-white"
+                  title="Wikipedia"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                />
+              </div>
+            )}
+
+            {activeEduTab === 'notes' && (
+              <div className="flex-1 w-full h-full min-h-0 relative overflow-hidden bg-white">
+                <NotesWorkspace />
+              </div>
+            )}
+
+            {activeEduTab === 'removepaywall' && (
+              <div className="flex-1 w-full h-full min-h-0 relative overflow-hidden">
+                <iframe 
+                  src="https://www.removepaywall.com/" 
+                  className="absolute inset-0 w-full h-full border-none"
+                  title="RemovePaywall Tool"
+                  sandbox="allow-scripts allow-same-origin allow-forms allow-popups"
+                  referrerPolicy="no-referrer"
+                />
+              </div>
             )}
 
           </div>
@@ -1351,28 +3096,14 @@ if (iconUrl.includes('.ico')) {
         {/* Floating Controls inside Lock Screen */}
         <div className="absolute top-4 right-4 flex items-center gap-3">
           
-          {/* Light/Dark Slider */}
-          <div className="flex items-center gap-2 border border-[var(--card-border)] bg-[var(--bg-secondary)] py-1.5 px-2.5 rounded-full shadow-sm">
-            <div 
-              onClick={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
-              className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 select-none transition-all duration-300"
-              title="Toggle Light/Dark Theme Mode"
-            >
-              <div 
-                className={`w-5 h-5 rounded-full bg-[var(--accent-color)] shadow-md transition-all duration-350 ease-out flex items-center justify-center text-[10px] transform ${
-                  mode === 'dark' ? 'translate-x-6' : 'translate-x-0'
-                }`}
-              >
-                {mode === 'dark' ? '🌙' : '☀️'}
-              </div>
-            </div>
-          </div>
-
           {/* Theme custom capsule */}
           <div className="border border-[var(--card-border)] bg-[var(--bg-secondary)] px-3 py-1.5 rounded-full flex items-center gap-2 shadow-sm">
             <div className="flex items-center gap-1.5">
               {[
                 { key: 'cyborg', color: 'bg-green-500 border-green-300 shadow-[0_0_5px_green]', tooltip: 'Cyborg Theme' },
+                { key: 'sunset', color: 'bg-amber-500 border-amber-300', tooltip: 'Sunset Theme' },
+                { key: 'midnight', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Midnight Theme' },
+                { key: 'forest', color: 'bg-emerald-500 border-emerald-300', tooltip: 'Forest Theme' },
                 { key: 'violet', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Violet Theme' },
                 { key: 'ice', color: 'bg-sky-400 border-sky-300', tooltip: 'Glacier Theme' },
                 { key: 'rose-pine', color: 'bg-rose-300 border-rose-200', tooltip: 'Rose Pine Theme' },
@@ -1390,13 +3121,54 @@ if (iconUrl.includes('.ico')) {
             </div>
           </div>
 
+          {/* Light/Dark Slider */}
+          <div className="relative flex items-center gap-1.5 border border-[var(--card-border)] bg-[var(--bg-secondary)] py-1.5 px-2.5 rounded-full shadow-sm">
+            {isWhiteDecoy && (
+              <button
+                type="button"
+                onClick={() => setShowGoGuardianNotice(prev => !prev)}
+                className={`p-1 rounded-full text-amber-500 hover:scale-115 transition-all cursor-pointer ${
+                  showGoGuardianNotice ? 'opacity-100 ring-2 ring-amber-500/40 bg-amber-500/10' : 'opacity-80 hover:opacity-100 animate-pulse'
+                }`}
+                title="GoGuardian Decoy Shield Notice (Click to open/close)"
+              >
+                <Shield className="w-3.5 h-3.5 fill-amber-500/20" />
+              </button>
+            )}
+
+            <div 
+              onClick={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
+              className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 select-none transition-all duration-300"
+              title="Toggle Light/Dark Theme Mode"
+            >
+              <div 
+                className={`w-5 h-5 rounded-full bg-[var(--accent-color)] shadow-md transition-all duration-350 ease-out flex items-center justify-center text-[10px] transform ${
+                  mode === 'dark' ? 'translate-x-6' : 'translate-x-0'
+                }`}
+              >
+                {mode === 'dark' ? '🌙' : '☀️'}
+              </div>
+            </div>
+
+            <AnimatePresence>
+              {isWhiteDecoy && showGoGuardianNotice && (
+                <GoGuardianDecoyNotice
+                  mode={mode}
+                  onToggleMode={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
+                  onClose={() => setShowGoGuardianNotice(false)}
+                  decoyType={decoyType}
+                  positionClass="absolute top-full right-0 mt-3 w-48 sm:w-56"
+                />
+              )}
+            </AnimatePresence>
+          </div>
         </div>
 
         {/* Lock Card Content Container */}
         <div className={`w-full max-w-sm bg-[var(--card-bg)] border border-[var(--card-border)] rounded-3xl p-6 md:p-8 shadow-2xl transition-all duration-300 flex flex-col items-center gap-6 flex-shrink-0 ${isShake ? 'animate-shake' : ''}`}>
           
           <div className="text-center">
-            <h2 className="text-xl font-bold tracking-tight text-[var(--text-primary)]">Portal Secured</h2>
+            <h2 className="text-xl font-bold tracking-tight text-[var(--text-primary)]">Portals Secured</h2>
             <p className="text-xs text-[var(--text-muted)] mt-1.5 leading-relaxed">This is a paid Science, Math, ELA, and Social Studies article website. Please enter a correct password to continue to the website.</p>
           </div>
 
@@ -1502,13 +3274,12 @@ if (iconUrl.includes('.ico')) {
           <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 pb-3 border-b border-[var(--card-border)]">
             <div>
               <h3 className="text-lg font-extrabold tracking-tight text-[var(--text-primary)] flex items-center gap-2">
-                <BookOpen className="text-[var(--accent-color)] w-5 h-5" />
+                <img src="https://ssl.gstatic.com/classroom/favicon.png" className="w-5 h-5 object-contain" alt="Classroom Logo" referrerPolicy="no-referrer" />
                 Examples of some articles
               </h3>
             </div>
             <div className="flex items-center gap-1.5 self-start sm:self-auto uppercase tracking-wider text-[10px] font-mono bg-[var(--bg-secondary)] py-1 px-2 rounded-md border border-[var(--card-border)] text-[var(--accent-color)]">
-              <Sparkles className="w-3.5 h-3.5 animate-pulse text-yellow-400" />
-              <span>AI generated examples</span>
+              <span>Educational examples</span>
             </div>
           </div>
 
@@ -1593,89 +3364,6 @@ if (iconUrl.includes('.ico')) {
                 )}
               </div>
 
-              {/* Creator board container */}
-              <div className="bg-[var(--bg-secondary)] border border-[var(--card-border)] rounded-2xl p-3 flex-shrink-0 flex flex-col gap-2">
-                <div className="flex items-center gap-1.5">
-                  <Sparkles className="w-3.5 h-3.5 text-yellow-400" />
-                  <span className="text-xs font-bold text-[var(--text-primary)] font-mono">Interactive AI Writer</span>
-                </div>
-                
-                <div className="grid grid-cols-2 gap-2">
-                  <div className="flex flex-col gap-0.5">
-                    <label className="text-[9px] font-mono text-[var(--text-muted)] uppercase tracking-wider">Subject</label>
-                    <select
-                      value={newArticleGame}
-                      onChange={(e) => setNewArticleGame(e.target.value)}
-                      className="text-[10px] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg p-1.5 text-[var(--text-primary)] cursor-pointer focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] font-mono"
-                      style={{ colorScheme: mode }}
-                    >
-                      {gameOptions.map(opt => (
-                        <option key={opt.value} value={opt.value} style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>{opt.label}</option>
-                      ))}
-                    </select>
-                  </div>
-                  <div className="flex flex-col gap-0.5">
-                    <label className="text-[9px] font-mono text-[var(--text-muted)] uppercase tracking-wider">Tone</label>
-                    <select
-                      value={newArticleTone}
-                      onChange={(e) => setNewArticleTone(e.target.value)}
-                      className="text-[10px] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg p-1.5 text-[var(--text-primary)] cursor-pointer focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] font-mono"
-                      style={{ colorScheme: mode }}
-                    >
-                      {toneOptions.map(opt => (
-                        <option key={opt.value} value={opt.value} style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>{opt.value}</option>
-                      ))}
-                    </select>
-                  </div>
-                </div>
-
-                <div className="flex flex-col gap-1 mt-1">
-                  <div className="flex items-center justify-between">
-                    <label className="text-[9px] font-mono text-[var(--text-muted)] uppercase tracking-wider">Customize Prompt</label>
-                    {isPromptUserModified && (
-                      <button 
-                        type="button" 
-                        onClick={() => {
-                          setIsPromptUserModified(false);
-                        }}
-                        className="text-[9px] font-mono text-[var(--accent-color)] hover:underline flex items-center gap-0.5 cursor-pointer bg-transparent border-none p-0"
-                      >
-                        Reset to preset
-                      </button>
-                    )}
-                  </div>
-                  <textarea
-                    value={customPromptText}
-                    onChange={(e) => {
-                      setCustomPromptText(e.target.value);
-                      setIsPromptUserModified(true);
-                    }}
-                    placeholder="Type a custom prompt for the AI to write about..."
-                    rows={2}
-                    className="text-[10px] bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg p-2 text-[var(--text-primary)] w-full focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] font-sans resize-none scrollbar-thin"
-                  />
-                </div>
-
-                <button
-                  type="button"
-                  onClick={handleGenerateArticle}
-                  disabled={isGeneratingArticle}
-                  className="w-full text-xs font-semibold bg-[var(--accent-color)] text-[var(--bg-color)] py-1.5 rounded-xl hover:opacity-95 active:scale-98 transition-all disabled:opacity-50 disabled:pointer-events-none cursor-pointer flex items-center justify-center gap-1.5 font-mono shadow-sm mt-0.5"
-                >
-                  {isGeneratingArticle ? (
-                    <>
-                      <Sparkles className="w-3 h-3 animate-spin text-yellow-300" />
-                      <span>DEEP WRITER ({generationProgress}%)...</span>
-                    </>
-                  ) : (
-                    <>
-                      <Sparkles className="w-3 h-3 text-yellow-300" />
-                      <span>GENERATE ARTICLE WITH AI</span>
-                    </>
-                  )}
-                </button>
-              </div>
-
             </div>
 
             {/* Right expanded active details reader card (cols 3) */}
@@ -1723,158 +3411,1112 @@ if (iconUrl.includes('.ico')) {
 
 
   return (
-    <div className="min-h-screen flex flex-col transition-colors duration-300">
+    <Suspense fallback={<div className="min-h-screen flex items-center justify-center bg-[var(--bg-color)] text-[var(--text-muted)] text-sm">Loading workspace...</div>}>
+      <div className={`min-h-screen flex flex-col transition-colors duration-300 relative overflow-x-clip ${viewMode === 'games' ? 'games-no-select select-none' : ''} ${selectedGame ? 'h-screen overflow-hidden' : ''}`}>
+      <CursorSpotlight active={viewMode === 'games' && animationsEnabled} />
       {/* HEADER */}
-      <nav className="border-b border-[var(--card-border)] bg-[var(--header-bg)] py-3.5 px-4 md:px-6 flex flex-col sm:flex-row justify-between items-center gap-4 transition-colors duration-300 sticky top-0 z-50 shadow-sm">
+      <AnimatePresence initial={false}>
+        {((!gameHeaderHidden || !selectedGame) || ['chat', 'lobbychat', 'movies', 'youtube', 'info', 'download'].includes(filter)) && (
+          <motion.header
+            key="main-header"
+            initial={animationsEnabled ? { height: 0, opacity: 0, overflow: "hidden" } : false}
+            animate={animationsEnabled ? { height: "auto", opacity: 1, transitionEnd: { overflow: "visible" } } : { height: "auto", opacity: 1 }}
+            exit={animationsEnabled ? { height: 0, opacity: 0, overflow: "hidden" } : undefined}
+            transition={animationsEnabled ? { duration: 0.35, ease: [0.16, 1, 0.3, 1] } : { duration: 0 }}
+            className="border-b border-[var(--card-border)] bg-[var(--header-bg)] shadow-sm sticky top-0 z-[5000] transition-colors duration-300 w-full"
+          >
+            {headerOpen ? (
+              <div className="py-2 px-3 md:px-5 flex flex-col sm:flex-row justify-between items-center gap-2.5 transition-colors duration-300">
         
-        {/* Left Side: Decoy Classroom Title */}
-        <div className="flex items-center gap-4 self-stretch sm:self-auto justify-between w-full sm:w-auto">
-          <div 
-            onClick={() => { setFilter('all'); setSelectedGame(null); setSearchQuery(''); }}
-            className="flex items-center gap-2.5 cursor-pointer select-none group"
-            title={
-              decoyType !== 'none' 
-                ? `Go to ${
-                    decoyType === 'classroom' 
-                      ? 'Classroom' 
-                      : decoyType === 'clever' 
-                      ? 'Clever' 
-                      : decoyType === 'campus' 
-                      ? 'Campus' 
-                      : decoyType === 'docs' 
-                      ? 'Google Docs' 
-                      : 'Inbox'
-                  } homepage` 
-                : "Go to StudyTools homepage"
-            }
-          >
-            <div className="p-2 bg-[var(--accent-color)] text-[var(--bg-color)] rounded-lg border border-[var(--card-border)] shadow-[0_2px_8.5px_var(--accent-shadow)] group-hover:rotate-12 group-hover:scale-110 transition-all duration-300 transform">
-              {decoyType === 'classroom' ? (
-                <School className="w-5.5 h-5.5" />
-              ) : decoyType === 'clever' ? (
-                <Compass className="w-5.5 h-5.5" />
-              ) : decoyType === 'campus' ? (
-                <School className="w-5.5 h-5.5" />
-              ) : decoyType === 'docs' ? (
-                <FileText className="w-5.5 h-5.5" />
-              ) : decoyType === 'gmail' ? (
-                <Mail className="w-5.5 h-5.5" />
-              ) : (
-                <BookOpen className="w-5.5 h-5.5" />
-              )}
-            </div>
-            <div>
-              <span className="text-xl font-bold tracking-tight text-[var(--text-primary)] block group-hover:text-[var(--accent-color)] transition-colors">
-                {decoyType === 'classroom' 
-                  ? "Home - Classroom" 
-                  : decoyType === 'clever' 
-                  ? "Clever | Log in with Clever" 
-                  : decoyType === 'campus' 
-                  ? "Campus Student" 
-                  : decoyType === 'docs' 
-                  ? "Google Docs" 
-                  : decoyType === 'gmail' 
-                  ? "Inbox - Jersey City Public Schools" 
-                  : "StudyTools"}
-              </span>
-            </div>
+        {/* Left Side: Logo & Title */}
+        <div 
+          onClick={() => { setFilter('all'); setSelectedGame(null); setSearchQuery(''); }}
+          className="flex items-center gap-2 cursor-pointer select-none group shrink-0"
+          title="Go to homepage"
+        >
+          <div className="p-1.5 bg-[var(--accent-color)] text-[var(--bg-color)] rounded-lg border border-[var(--card-border)] shadow-md group-hover:rotate-12 transition-all duration-300 transform flex items-center justify-center shrink-0">
+            <School className="w-4 h-4" />
           </div>
-
-          {/* Sign Out Button right after Classroom */}
-          <button
-            onClick={() => {
-              setViewModeAndSave('articles');
-              setPasscode('');
-            }}
-            className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-mono font-semibold bg-[var(--bg-secondary)] border border-[var(--card-border)] hover:border-red-500/50 hover:bg-red-500/10 text-[var(--text-primary)] hover:text-red-500 transition-all duration-200 cursor-pointer shadow-sm group"
-            title="Sign Out to Lock Screen"
-          >
-            <LogOut className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
-            <span>Sign Out</span>
-          </button>
-        </div>
-
-        {/* Middle Search Bar */}
-        <div className="relative w-full max-w-sm sm:mx-4">
-          <span className="absolute inset-y-0 left-0 pl-3 flex items-center pointer-events-none text-[var(--text-muted)]">
-            <Search className="h-4 w-4" />
-          </span>
-          <input
-            type="text"
-            placeholder="Search school games..."
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            className="w-full text-sm rounded-full py-2.5 pl-9 pr-4 border border-[var(--card-border)] bg-[var(--input-fill)] text-[var(--text-primary)] focus:outline-none focus:ring-1 focus:ring-[var(--accent-color)] placeholder:opacity-50 transition-all duration-300 shadow-inner"
-          />
+          <div className="flex flex-row items-baseline gap-2 flex-wrap">
+            <h1 className="font-extrabold tracking-tight text-[var(--text-primary)] leading-none group-hover:text-[var(--accent-color)] transition-colors text-left" style={{ fontSize: '12px', textAlign: 'left' }}>
+              StudyTools Portals
+            </h1>
+          </div>
         </div>
 
         {/* Right Side Controls */}
-        <div className="flex items-center gap-3 md:gap-4 self-stretch sm:self-auto justify-between sm:justify-end flex-wrap sm:flex-nowrap">
+        <div className="flex flex-wrap items-center gap-2 md:gap-4 flex-1 min-w-0 justify-between">
           
-          <div className="text-[11px] font-mono select-none opacity-80 pl-1">
-            <span className="text-xs opacity-50 block sm:inline mr-1">made by</span>
-            <span className="font-bold text-[var(--accent-color)] tracking-wider">™ AND GRANDDIA2</span>
-          </div>
-
-          {/* Light/Dark slider */}
-          <div className="flex items-center gap-2 border border-[var(--card-border)] bg-[var(--bg-secondary)] py-1 md:py-1.5 px-2.5 rounded-full shadow-sm">
-            <div 
-              onClick={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
-              className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 select-none transition-all duration-300"
-              title="Slide to change Mode (Light / Dark)"
+          {/* Workspaces & Icons Group (moves left for extra space) */}
+          <div className="flex flex-wrap items-center gap-1.5 shrink min-w-0 justify-start">
+            {/* Movies Button */}
+            <motion.button
+              whileHover={animationsEnabled ? { scale: 1.05 } : undefined}
+              whileTap={animationsEnabled ? { scale: 0.95 } : undefined}
+              onClick={() => { setFilter(filter === 'movies' ? 'all' : 'movies'); setSelectedGame(null); }}
+              className={`relative px-3 py-1.5 rounded-lg border text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-all duration-200 ${
+                filter === 'movies'
+                  ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] shadow-[0_2px_8px_var(--accent-shadow)]'
+                  : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-[var(--accent-color)]/50 hover:text-[var(--accent-color)]'
+              }`}
+              title="Movies Workspace"
             >
-              <div 
-                className={`w-5 h-5 rounded-full bg-[var(--accent-color)] shadow-md transition-all duration-350 ease-out flex items-center justify-center text-[10px] transform ${
-                  mode === 'dark' ? 'translate-x-6' : 'translate-x-0'
+              <Tv className="w-3.5 h-3.5" />
+              <span style={{ fontSize: '9px', lineHeight: '18px', textAlign: 'center', fontStyle: 'normal', fontWeight: 'normal', fontFamily: 'Inter' }}>movies</span>
+            </motion.button>
+
+            {/* Lobby Chat Button */}
+            <motion.button
+              whileHover={animationsEnabled ? { scale: 1.05 } : undefined}
+              whileTap={animationsEnabled ? { scale: 0.95 } : undefined}
+              onClick={() => { setFilter(filter === 'lobbychat' ? 'all' : 'lobbychat'); setSelectedGame(null); }}
+              className={`relative px-3 py-1.5 rounded-lg border text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-all duration-200 ${
+                filter === 'lobbychat'
+                  ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] shadow-[0_2px_8px_var(--accent-shadow)] font-bold'
+                  : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-[var(--accent-color)]/50 hover:text-[var(--accent-color)]'
+              }`}
+              title="Lobby Chat"
+            >
+              <MessageSquare className="w-3.5 h-3.5" />
+              <LobbyUnreadIndicator visible={hasUnreadLobby} />
+              <span>Lobby Chat</span>
+            </motion.button>
+
+            {/* YouTube Workspace Button */}
+            <motion.button
+              whileHover={animationsEnabled ? { scale: 1.05 } : undefined}
+              whileTap={animationsEnabled ? { scale: 0.95 } : undefined}
+              onClick={() => { setFilter(filter === 'youtube' ? 'all' : 'youtube'); setSelectedGame(null); }}
+              className={`px-3 py-1.5 rounded-lg border text-xs font-mono font-bold flex items-center gap-1.5 cursor-pointer transition-all duration-200 ${
+                filter === 'youtube'
+                  ? 'bg-red-600 text-white border-red-600 shadow-[0_2px_8px_rgba(220,38,38,0.5)] font-bold'
+                  : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-red-500/50 hover:text-red-500'
+              }`}
+              title="YouTube Workspace"
+            >
+              <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <path d="M23.498 6.163a3.003 3.003 0 0 0-2.11-2.11C19.517 3.545 12 3.545 12 3.545s-7.517 0-9.388.508a3.003 3.003 0 0 0-2.11 2.11C0 8.033 0 12 0 12s0 3.967.502 5.837a3.003 3.003 0 0 0 2.11 2.11c1.871.508 9.388.508 9.388.508s7.517 0 9.388-.508a3.003 3.003 0 0 0 2.11-2.11C24 15.967 24 12 24 12s0-3.967-.502-5.837z" fill={filter === 'youtube' ? "#FFFFFF" : "#FF0000"} />
+                <path d="M9.545 15.568V8.432L15.818 12l-6.273 3.568z" fill={filter === 'youtube' ? "#FF0000" : "#FFFFFF"} />
+              </svg>
+              <span>YouTube</span>
+            </motion.button>
+
+            {/* Decoy Selector */}
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono font-bold text-neutral-400 uppercase select-none">Decoy:</span>
+              <DecoyDropdown value={decoyType} onChange={setDecoyType} mode={mode} />
+
+              <AutoRandomizeDecoyButton
+                autoRandomize={autoRandomizeDecoy}
+                setAutoRandomize={setAutoRandomizeDecoy}
+                interval={randomizeInterval}
+                setInterval={updateRandomizeInterval}
+                pool={randomizePool}
+                togglePoolItem={toggleDecoyInPool}
+                selectAllPool={selectAllDecoys}
+                countdown={randomizeCountdown}
+                onRandomizeNow={triggerManualRandomize}
+                currentDecoy={decoyType}
+                mode={mode}
+              />
+
+              {/* Cloak / About:blank Button (to the right of shuffle button) */}
+              <motion.button
+                whileHover={filter !== 'lobbychat' ? { scale: 1.05 } : {}}
+                whileTap={filter !== 'lobbychat' ? { scale: 0.95 } : {}}
+                onClick={() => { if (filter !== 'lobbychat') openWorkspaceInAboutBlank(filter); }}
+                className={`px-3 py-1.5 rounded-lg border flex items-center gap-1.5 text-xs font-semibold transition-all ${
+                  filter !== 'lobbychat'
+                    ? 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] hover:border-[var(--accent-color)] cursor-pointer'
+                    : 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] opacity-40 cursor-not-allowed'
                 }`}
+                title={
+                  filter === 'movies' ? "Open Movies in about:blank" :
+                  filter === 'youtube' ? "Open YouTube in about:blank" :
+                  filter === 'chat' ? "Open AI Chat in about:blank" :
+                  filter === 'lobbychat' ? "Open Lobby Chat in about:blank" :
+                  filter === 'download' ? "Open Download in about:blank" :
+                  "Cloak site in about:blank"
+                }
               >
-                {mode === 'dark' ? '🌙' : '☀️'}
-              </div>
+                <ExternalLink className="w-3.5 h-3.5" />
+                <span>Cloak</span>
+              </motion.button>
+
+              {/* Open Link Button */}
+              {(() => {
+                const url = filter === 'movies' ? 'https://urnperiodic.github.io/p/' : filter === 'youtube' ? 'https://urnperiodic.github.io/youtube1/' : filter === 'chat' ? 'https://grandplat2.vercel.app/' : filter === 'download' ? 'https://urnperiodic.github.io/download/' : '';
+                const hasUrl = !!url;
+                return (
+                  <motion.button
+                    whileHover={hasUrl ? { scale: 1.05 } : {}}
+                    whileTap={hasUrl ? { scale: 0.95 } : {}}
+                    onClick={() => { if (hasUrl) window.open(url, '_blank'); }}
+                    className={`px-3 py-1.5 rounded-lg border flex items-center gap-1.5 text-xs font-semibold transition-all ${
+                      hasUrl 
+                        ? 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] hover:border-[var(--accent-color)] hover:bg-[var(--accent-color)]/10 cursor-pointer shadow-[0_0_8px_rgba(0,0,0,0)] hover:shadow-[0_0_8px_var(--accent-color)]'
+                        : 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] opacity-40 cursor-not-allowed'
+                    }`}
+                    title={hasUrl ? "Open Workspace in new tab" : "No external link available"}
+                  >
+                    <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                    <span>Open Link</span>
+                  </motion.button>
+                );
+              })()}
             </div>
+
+            {/* Quick Exit & Open Separately buttons for Workspaces (Sticky) */}
+            <AnimatePresence>
+              {(filter === 'movies' || filter === 'chat' || filter === 'youtube' || filter === 'lobbychat' || filter === 'download') && (
+                <motion.div 
+                  key="workspace-actions-sticky"
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  exit={{ opacity: 0, scale: 0.95 }}
+                  transition={{ duration: 0.15, ease: "easeOut" }}
+                  className="flex items-center gap-1.5 pl-2 ml-1 border-l border-[var(--card-border)]/50 whitespace-nowrap"
+                >
+                  <button
+                    onClick={() => setFilter('all')}
+                    className="p-1.5 rounded-lg border border-rose-500/40 hover:border-rose-500 bg-rose-500/10 text-rose-500 hover:text-white hover:bg-rose-500 transition-all cursor-pointer flex items-center justify-center shrink-0 group"
+                    title="Close Workspace"
+                  >
+                    <X className="w-3.5 h-3.5" />
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
-          {/* Theme capsule */}
-          <div className="border border-[var(--card-border)] bg-[var(--bg-secondary)] px-3 py-1.5 rounded-full flex items-center gap-2 shadow-sm">
-            <div className="flex items-center gap-1.5">
-              {[
-                { key: 'cyborg', color: 'bg-green-500 border-green-300 shadow-[0_0_5px_green]', tooltip: 'Cyborg Theme' },
-                { key: 'violet', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Violet Theme' },
-                { key: 'ice', color: 'bg-sky-400 border-sky-300', tooltip: 'Glacier Theme' },
-                { key: 'rose-pine', color: 'bg-rose-300 border-rose-200', tooltip: 'Rose Pine Theme' },
-                { key: 'none', color: 'bg-gradient-to-br from-neutral-300 to-neutral-700 border-neutral-400', tooltip: 'No Theme (Monochrome)' }
-              ].map((themeOpt) => (
-                <button
-                  key={themeOpt.key}
-                  title={themeOpt.tooltip}
-                  onClick={() => setTheme(themeOpt.key)}
-                  className={`w-3.5 h-3.5 rounded-full ${themeOpt.color} border transition-all duration-200 hover:scale-130 cursor-pointer ${
-                    theme === themeOpt.key ? 'ring-2 ring-offset-2 ring-[var(--accent-color)]' : 'opacity-80'
-                  }`}
-                />
-              ))}
-            </div>
-          </div>
         </div>
 
-      </nav>
+      </div>
+      ) : (
+        <div 
+          ref={compactHeaderRef}
+          className="relative py-1.5 px-3 md:px-4 flex items-center justify-between gap-2 md:gap-3 w-full transition-colors duration-300 min-h-[42px] overflow-visible"
+        >
+          
+          {/* Left: Logo & Title + Search Bar */}
+          <div className="flex items-center gap-2.5 sm:gap-3 shrink-0 z-10">
+            <div 
+              ref={compactLeftRef}
+              onClick={() => { setFilter('all'); setSelectedGame(null); setSearchQuery(''); }}
+              className="flex items-center gap-2 cursor-pointer select-none group shrink-0 justify-start"
+              title="Go to homepage"
+            >
+              <div className="p-1 bg-[var(--accent-color)] text-[var(--bg-color)] rounded-md border border-[var(--card-border)] shadow-sm group-hover:rotate-12 transition-all duration-300 transform flex items-center justify-center shrink-0">
+                <School className="w-3.5 h-3.5" style={{ fontFamily: 'Verdana', fontWeight: 'normal' }} />
+              </div>
+              <div className="flex flex-col items-start justify-center">
+                <span className="text-left whitespace-nowrap flex flex-col justify-center select-none">
+                  <span 
+                    className="text-[8px] leading-[11px] tracking-tight flex items-center gap-1 transition-colors"
+                    style={{ fontFamily: 'Plus Jakarta Sans, sans-serif' }}
+                  >
+                    <span className="text-neutral-400 font-bold" style={{ fontFamily: 'Plus Jakarta Sans, sans-serif', fontWeight: 'bold' }}>Leadcreator:</span>
+                    <span className="font-bold text-[var(--text-primary)]" style={{ fontFamily: 'Plus Jakarta Sans, sans-serif' }}>Thorne Thompson (TT)</span>
+                  </span>
+                  <span 
+                    className="text-[8px] leading-[11px] tracking-tight flex items-center gap-1 transition-colors"
+                    style={{ fontFamily: 'Plus Jakarta Sans, sans-serif' }}
+                  >
+                    <span className="text-neutral-400 font-bold" style={{ fontFamily: 'Plus Jakarta Sans, sans-serif', fontWeight: 'bold' }}>Cocreator:</span>
+                    <span className="font-bold text-[var(--accent-color)]" style={{ fontFamily: 'Plus Jakarta Sans, sans-serif' }}>SharpRLBS</span>
+                  </span>
+                </span>
+              </div>
+            </div>
+
+            {/* Compact Search Bar next to Name */}
+            <div className="relative flex items-center w-20 sm:w-24 md:w-28 shrink-0 transition-all duration-200">
+              <Search className="absolute left-1.5 w-2.5 h-2.5 text-[var(--accent-color)] pointer-events-none shrink-0" />
+              <input
+                ref={searchInputRef}
+                type="text"
+                placeholder="Search..."
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Escape') {
+                    setSearchQuery('');
+                  }
+                }}
+                className="w-full h-5 bg-[var(--card-bg)] border border-[var(--card-border)] hover:border-[var(--accent-color)]/50 focus:border-[var(--accent-color)] text-[var(--text-primary)] text-[10px] rounded-md pl-5 pr-5 py-0 outline-none shadow-sm transition-all duration-200 placeholder:text-[var(--text-muted)]/60 min-w-0"
+              />
+              {searchQuery && (
+                <button
+                  onClick={() => setSearchQuery('')}
+                  className="absolute right-1 p-0.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors cursor-pointer shrink-0"
+                  title="Clear search"
+                >
+                  <X className="w-2.5 h-2.5" />
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* Center: Quick Sections & Navigation (fluid center without absolute clipping) */}
+          <div 
+            ref={compactCenterRef}
+            className="flex items-center justify-center gap-1.5 min-w-0 shrink mx-auto z-10"
+          >
+            {/* Quick Sections with backgrounds for mobile/tablet wrapped cleanly */}
+            <div className="flex md:hidden items-center gap-1 bg-[var(--bg-secondary)] border border-[var(--card-border)]/50 p-0.5 rounded-lg shadow-sm shrink-0">
+              <button
+                onClick={() => { setFilter(filter === 'movies' ? 'all' : 'movies'); setSelectedGame(null); }}
+                className={`relative p-1 rounded-md text-xs transition-all duration-200 ${
+                  filter === 'movies'
+                    ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_1px_5px_var(--accent-shadow)] font-bold'
+                    : 'bg-transparent text-[var(--text-primary)] hover:text-[var(--accent-color)]'
+                }`}
+                title="Movies"
+              >
+                <Tv className="w-3.5 h-3.5" />
+              </button>
+
+              <button
+                onClick={() => { setFilter(filter === 'chat' ? 'all' : 'chat'); setSelectedGame(null); }}
+                className={`p-1 px-1.5 rounded-md text-xs font-sans font-black transition-all duration-200 flex items-center justify-center ${
+                  filter === 'chat'
+                    ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_1px_5px_var(--accent-shadow)]'
+                    : 'bg-transparent text-[var(--text-primary)] hover:text-[var(--accent-color)]'
+                }`}
+                title="Gemini AI Chat"
+              >
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M12 0C12 6.627 6.627 12 0 12C6.627 12 12 17.373 12 24C12 17.373 17.373 12 24 12C17.373 12 12 6.627 12 0Z" fill="currentColor" />
+                </svg>
+              </button>
+
+              <button
+                onClick={() => { setFilter(filter === 'lobbychat' ? 'all' : 'lobbychat'); setSelectedGame(null); }}
+                className={`p-1 rounded-md text-xs transition-all duration-200 ${
+                  filter === 'lobbychat'
+                    ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_1px_5px_var(--accent-shadow)] font-bold'
+                    : 'bg-transparent text-[var(--text-primary)] hover:text-[var(--accent-color)]'
+                }`}
+                title="Lobby Chat"
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                <LobbyUnreadIndicator visible={hasUnreadLobby} />
+              </button>
+
+              <button
+                onClick={() => { setFilter(filter === 'youtube' ? 'all' : 'youtube'); setSelectedGame(null); }}
+                className={`p-1 rounded-md text-xs transition-all duration-200 ${
+                  filter === 'youtube'
+                    ? 'bg-red-600 text-white shadow-[0_1px_5px_rgba(220,38,38,0.5)] font-bold'
+                    : 'bg-transparent text-[var(--text-primary)] hover:text-red-500'
+                }`}
+                title="YouTube"
+              >
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M23.498 6.163a3.003 3.003 0 0 0-2.11-2.11C19.517 3.545 12 3.545 12 3.545s-7.517 0-9.388.508a3.003 3.003 0 0 0-2.11 2.11C0 8.033 0 12 0 12s0 3.967.502 5.837a3.003 3.003 0 0 0 2.11 2.11c1.871.508 9.388.508 9.388.508s7.517 0 9.388-.508a3.003 3.003 0 0 0 2.11-2.11C24 15.967 24 12 24 12s0-3.967-.502-5.837z" fill={filter === 'youtube' ? "#FFFFFF" : "#FF0000"} />
+                  <path d="M9.545 15.568V8.432L15.818 12l-6.273 3.568z" fill={filter === 'youtube' ? "#FF0000" : "#FFFFFF"} />
+                </svg>
+              </button>
+
+              {/* Decoy Selector & Auto Randomize */}
+              <div className="flex items-center gap-1">
+                <DecoyDropdown value={decoyType} onChange={setDecoyType} mode={mode} compact={true} />
+
+                <AutoRandomizeDecoyButton
+                  autoRandomize={autoRandomizeDecoy}
+                  setAutoRandomize={setAutoRandomizeDecoy}
+                  interval={randomizeInterval}
+                  setInterval={updateRandomizeInterval}
+                  pool={randomizePool}
+                  togglePoolItem={toggleDecoyInPool}
+                  selectAllPool={selectAllDecoys}
+                  countdown={randomizeCountdown}
+                  onRandomizeNow={triggerManualRandomize}
+                  currentDecoy={decoyType}
+                  mode={mode}
+                  compact={true}
+                />
+
+                {/* Cloak & Open Link Buttons */}
+                <div className="flex items-center gap-0.5">
+                  <button
+                    onClick={() => { if (filter !== 'lobbychat') openWorkspaceInAboutBlank(filter); }}
+                    className={`p-1 rounded-md transition-all ${
+                      filter !== 'lobbychat'
+                        ? 'text-[var(--accent-color)] hover:bg-[var(--accent-color)]/10 cursor-pointer'
+                        : 'text-[var(--accent-color)] opacity-40 cursor-not-allowed'
+                    }`}
+                    title={
+                      filter === 'movies' ? "Open Movies in about:blank" :
+                      filter === 'youtube' ? "Open YouTube in about:blank" :
+                      filter === 'chat' ? "Open AI Chat in about:blank" :
+                      filter === 'lobbychat' ? "Open Lobby Chat in about:blank" :
+                      filter === 'download' ? "Open Download in about:blank" :
+                      "Cloak site in about:blank"
+                    }
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </button>
+
+                  {(() => {
+                    const url = filter === 'movies' ? 'https://urnperiodic.github.io/p/' : filter === 'youtube' ? 'https://urnperiodic.github.io/youtube1/' : filter === 'chat' ? 'https://grandplat2.vercel.app/' : filter === 'download' ? 'https://urnperiodic.github.io/download/' : '';
+                    const hasUrl = !!url;
+                    return (
+                      <button
+                        onClick={() => { if (hasUrl) window.open(url, '_blank'); }}
+                        className={`p-1 rounded-md transition-all ${
+                          hasUrl
+                            ? 'text-[var(--accent-color)] hover:bg-[var(--accent-color)]/10 cursor-pointer shadow-[0_0_8px_rgba(0,0,0,0)] hover:shadow-[0_0_8px_var(--accent-color)]'
+                            : 'text-[var(--accent-color)] opacity-40 cursor-not-allowed'
+                        }`}
+                        title={hasUrl ? "Open Workspace in new tab" : "No external link available"}
+                      >
+                        <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                      </button>
+                    );
+                  })()}
+                </div>
+              </div>
+            </div>
+
+            {/* Middle: Section Icons with Background (Visible on medium+ screens) */}
+            <div className="hidden md:flex items-center gap-1.5 bg-[var(--bg-secondary)] border border-[var(--card-border)]/50 p-1 rounded-xl shadow-sm">
+              {/* Movies Button */}
+              <div className="relative">
+                <button
+                  onClick={() => { setFilter(filter === 'movies' ? 'all' : 'movies'); setSelectedGame(null); }}
+                  className={`p-1.5 rounded-lg border text-xs font-mono font-bold flex items-center justify-center cursor-pointer transition-all duration-200 ${
+                    filter === 'movies'
+                      ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] shadow-[0_2px_8px_var(--accent-shadow)]'
+                      : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-[var(--accent-color)]/50 hover:text-[var(--accent-color)]'
+                  } ${showNotices && noticeStep === 1 ? 'ring-2 ring-[var(--accent-color)] ring-offset-2 ring-offset-[#0d0d12] animate-pulse' : ''}`}
+                  title="Movies Workspace"
+                >
+                  <Tv className="w-3.5 h-3.5" />
+                </button>
+
+                {showNotices && noticeStep === 1 && (
+                  <div className="absolute top-full left-0 mt-3 w-80 bg-[#13111c] border-2 border-amber-500/80 text-white rounded-xl p-3.5 shadow-[0_0_30px_rgba(245,158,11,0.4)] z-[3000] animate-fade-in select-none text-left text-xs font-medium">
+                    <div className="absolute -top-2.5 left-3 w-3.5 h-3.5 bg-[#13111c] border-t-2 border-l-2 border-amber-500/80 transform rotate-45" />
+
+                    {/* IMPORTANT WARNING HEADER BANNER */}
+                    <div className="bg-amber-500/15 border border-amber-500/40 rounded-lg px-2.5 py-1.5 mb-2.5 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-amber-400 font-black text-[11px] uppercase tracking-wider">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 animate-bounce shrink-0" />
+                        <span>IMPORTANT WARNING</span>
+                      </div>
+                      <button
+                        onClick={closeNotices}
+                        className="px-2 py-0.5 text-[10px] text-neutral-300 hover:text-white bg-white/10 hover:bg-red-500/80 rounded-md transition-all cursor-pointer shrink-0 font-sans font-bold flex items-center gap-1 border border-white/10"
+                        title="Close Notifications"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Close</span>
+                      </button>
+                    </div>
+
+                    <div className="mb-2 text-[10px] font-bold text-amber-300 bg-amber-500/10 px-2 py-1 rounded-md border border-amber-500/20 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                      <span>You need to read this only once</span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-[10px] text-[var(--accent-color)] font-mono font-bold uppercase tracking-wider">
+                      <Tv className="w-3.5 h-3.5" />
+                      <span>Tip 2 of 4 • Movies</span>
+                    </div>
+
+                    <p className="mt-2 text-[11px] leading-relaxed text-neutral-200 font-semibold">
+                      The movies/tv shows/anime button does not work at school as Iboss blocks all the servers from working.
+                    </p>
+
+                    <div className="mt-3 pt-2 border-t border-white/10 flex items-center justify-between text-[10px]">
+                      <span className="flex items-center gap-1 text-amber-400 font-mono font-bold">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                        {noticeCountdown}s
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={prevNoticeStep}
+                          className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-neutral-200 transition-colors cursor-pointer font-sans"
+                        >
+                          ← Prev
+                        </button>
+                        <button
+                          onClick={closeNotices}
+                          className="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-600 text-red-200 hover:text-white font-bold transition-all cursor-pointer font-sans border border-red-500/40 flex items-center gap-1"
+                          title="Close notifications"
+                        >
+                          <X className="w-3 h-3" />
+                          <span>Close</span>
+                        </button>
+                        <button
+                          onClick={nextNoticeStep}
+                          className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-black font-black transition-all cursor-pointer font-sans shadow-md"
+                        >
+                          Next →
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/10 rounded-b-xl overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 transition-all duration-1000 ease-linear"
+                        style={{ width: `${(noticeCountdown / 20) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Socratic Tutor Button */}
+              <button
+                onClick={() => { setFilter(filter === 'chat' ? 'all' : 'chat'); setSelectedGame(null); }}
+                className={`p-1.5 px-2.5 rounded-lg border text-xs font-sans font-black flex items-center justify-center cursor-pointer transition-all duration-200 ${
+                  filter === 'chat'
+                    ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] shadow-[0_2px_8px_var(--accent-shadow)]'
+                    : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-[var(--accent-color)]/50 hover:text-[var(--accent-color)]'
+                }`}
+                title="Gemini AI Chat Tutor"
+              >
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M12 0C12 6.627 6.627 12 0 12C6.627 12 12 17.373 12 24C12 17.373 17.373 12 24 12C17.373 12 12 6.627 12 0Z" fill="currentColor" />
+                </svg>
+              </button>
+
+              {/* Lobby Chat Button */}
+              <button
+                onClick={() => { setFilter(filter === 'lobbychat' ? 'all' : 'lobbychat'); setSelectedGame(null); }}
+                className={`relative p-1.5 rounded-lg border text-xs font-mono font-bold flex items-center justify-center cursor-pointer transition-all duration-200 ${
+                  filter === 'lobbychat'
+                    ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] shadow-[0_2px_8px_var(--accent-shadow)]'
+                    : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-[var(--accent-color)]/50 hover:text-[var(--accent-color)]'
+                }`}
+                title="Lobby Chat"
+              >
+                <MessageSquare className="w-3.5 h-3.5" />
+                <LobbyUnreadIndicator visible={hasUnreadLobby} />
+              </button>
+
+              {/* YouTube Workspace Button */}
+              <button
+                onClick={() => { setFilter(filter === 'youtube' ? 'all' : 'youtube'); setSelectedGame(null); }}
+                className={`p-1.5 rounded-lg border text-xs font-mono font-bold flex items-center justify-center cursor-pointer transition-all duration-200 ${
+                  filter === 'youtube'
+                    ? 'bg-red-600 text-white border-red-600 shadow-[0_2px_8px_rgba(220,38,38,0.5)] font-bold'
+                    : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-red-500/50 hover:text-red-500'
+                }`}
+                title="YouTube"
+              >
+                <svg viewBox="0 0 24 24" className="w-3.5 h-3.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                  <path d="M23.498 6.163a3.003 3.003 0 0 0-2.11-2.11C19.517 3.545 12 3.545 12 3.545s-7.517 0-9.388.508a3.003 3.003 0 0 0-2.11 2.11C0 8.033 0 12 0 12s0 3.967.502 5.837a3.003 3.003 0 0 0 2.11 2.11c1.871.508 9.388.508 9.388.508s7.517 0 9.388-.508a3.003 3.003 0 0 0 2.11-2.11C24 15.967 24 12 24 12s0-3.967-.502-5.837z" fill={filter === 'youtube' ? "#FFFFFF" : "#FF0000"} />
+                  <path d="M9.545 15.568V8.432L15.818 12l-6.273 3.568z" fill={filter === 'youtube' ? "#FF0000" : "#FFFFFF"} />
+                </svg>
+              </button>
+
+              {/* Decoy Selector & Auto Randomize */}
+              <div className="relative flex items-center gap-1">
+                <div className={showNotices && noticeStep === 3 ? 'ring-2 ring-[var(--accent-color)] ring-offset-2 ring-offset-[#0d0d12] rounded-lg animate-pulse' : ''}>
+                  <DecoyDropdown value={decoyType} onChange={setDecoyType} mode={mode} compact={true} />
+                </div>
+
+                <AutoRandomizeDecoyButton
+                  autoRandomize={autoRandomizeDecoy}
+                  setAutoRandomize={setAutoRandomizeDecoy}
+                  interval={randomizeInterval}
+                  setInterval={updateRandomizeInterval}
+                  pool={randomizePool}
+                  togglePoolItem={toggleDecoyInPool}
+                  selectAllPool={selectAllDecoys}
+                  countdown={randomizeCountdown}
+                  onRandomizeNow={triggerManualRandomize}
+                  currentDecoy={decoyType}
+                  mode={mode}
+                  compact={true}
+                />
+
+                {/* Cloak / About:blank Button (to the right of shuffle button) */}
+                <div className="relative">
+                  <button
+                    onClick={() => { if (filter !== 'lobbychat') openWorkspaceInAboutBlank(filter); }}
+                    className={`p-1.5 rounded-lg border flex items-center justify-center transition-all ${
+                      filter !== 'lobbychat'
+                        ? 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] hover:border-[var(--accent-color)] cursor-pointer'
+                        : 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] opacity-40 cursor-not-allowed'
+                    } ${showNotices && noticeStep === 2 ? 'ring-2 ring-[var(--accent-color)] ring-offset-2 ring-offset-[#0d0d12] animate-pulse' : ''}`}
+                    title={
+                      filter === 'movies' ? "Open Movies in about:blank" :
+                      filter === 'youtube' ? "Open YouTube in about:blank" :
+                      filter === 'chat' ? "Open AI Chat in about:blank" :
+                      filter === 'lobbychat' ? "Open Lobby Chat in about:blank" :
+                      filter === 'download' ? "Open Download in about:blank" :
+                      "Cloak site in about:blank"
+                    }
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                  </button>
+
+                  {showNotices && noticeStep === 2 && (
+                    <div className="absolute top-full left-1/2 -translate-x-1/2 mt-3 w-80 bg-[#13111c] border-2 border-amber-500/80 text-white rounded-xl p-3.5 shadow-[0_0_30px_rgba(245,158,11,0.4)] z-[3000] animate-fade-in select-none text-left text-xs font-medium">
+                      <div className="absolute -top-2.5 left-1/2 -translate-x-1/2 w-3.5 h-3.5 bg-[#13111c] border-t-2 border-l-2 border-amber-500/80 transform rotate-45" />
+
+                      {/* IMPORTANT WARNING HEADER BANNER */}
+                      <div className="bg-amber-500/15 border border-amber-500/40 rounded-lg px-2.5 py-1.5 mb-2.5 flex items-center justify-between gap-2">
+                        <div className="flex items-center gap-1.5 text-amber-400 font-black text-[11px] uppercase tracking-wider">
+                          <AlertTriangle className="w-4 h-4 text-amber-400 animate-bounce shrink-0" />
+                          <span>IMPORTANT WARNING</span>
+                        </div>
+                        <button
+                          onClick={closeNotices}
+                          className="px-2 py-0.5 text-[10px] text-neutral-300 hover:text-white bg-white/10 hover:bg-red-500/80 rounded-md transition-all cursor-pointer shrink-0 font-sans font-bold flex items-center gap-1 border border-white/10"
+                          title="Close Notifications"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                          <span>Close</span>
+                        </button>
+                      </div>
+
+                      <div className="mb-2 text-[10px] font-bold text-amber-300 bg-amber-500/10 px-2 py-1 rounded-md border border-amber-500/20 flex items-center gap-1.5">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                        <span>You need to read this only once</span>
+                      </div>
+
+                      <div className="flex items-center gap-1.5 text-[10px] text-[var(--accent-color)] font-mono font-bold uppercase tracking-wider">
+                        <ExternalLink className="w-3.5 h-3.5" />
+                        <span>Tip 3 of 4 • Cloak Screen</span>
+                      </div>
+
+                      <p className="mt-2 text-[11px] leading-relaxed text-neutral-200 font-semibold">
+                        Open in about:blank masks your screen from GoGuardian in a blank screen and masks the URL (it doesn't even appear in your search history), but can confuse older teachers and looks suspicious when multiple students have blank screens.
+                      </p>
+
+                      <div className="mt-3 pt-2 border-t border-white/10 flex items-center justify-between text-[10px]">
+                        <span className="flex items-center gap-1 text-amber-400 font-mono font-bold">
+                          <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                          {noticeCountdown}s
+                        </span>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            onClick={prevNoticeStep}
+                            className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-neutral-200 transition-colors cursor-pointer font-sans"
+                          >
+                            ← Prev
+                          </button>
+                          <button
+                            onClick={closeNotices}
+                            className="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-600 text-red-200 hover:text-white font-bold transition-all cursor-pointer font-sans border border-red-500/40 flex items-center gap-1"
+                            title="Close notifications"
+                          >
+                            <X className="w-3 h-3" />
+                            <span>Close</span>
+                          </button>
+                          <button
+                            onClick={nextNoticeStep}
+                            className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-black font-black transition-all cursor-pointer font-sans shadow-md"
+                          >
+                            Next →
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/10 rounded-b-xl overflow-hidden">
+                        <div
+                          className="h-full bg-amber-500 transition-all duration-1000 ease-linear"
+                          style={{ width: `${(noticeCountdown / 20) * 100}%` }}
+                        />
+                      </div>
+                    </div>
+                  )}
+                </div>
+
+                {/* Open Link Button */}
+                {(() => {
+                  const url = filter === 'movies' ? 'https://urnperiodic.github.io/p/' : filter === 'youtube' ? 'https://urnperiodic.github.io/youtube1/' : filter === 'chat' ? 'https://grandplat2.vercel.app/' : filter === 'download' ? 'https://urnperiodic.github.io/download/' : '';
+                  const hasUrl = !!url;
+                  return (
+                    <button
+                      onClick={() => { if (hasUrl) window.open(url, '_blank'); }}
+                      className={`p-1.5 rounded-lg border transition-all flex items-center justify-center ${
+                        hasUrl
+                          ? 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] hover:border-[var(--accent-color)] hover:bg-[var(--accent-color)]/10 cursor-pointer shadow-[0_0_8px_rgba(0,0,0,0)] hover:shadow-[0_0_8px_var(--accent-color)]'
+                          : 'border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--accent-color)] opacity-40 cursor-not-allowed'
+                      }`}
+                      title={hasUrl ? "Open Workspace in new tab" : "No external link available"}
+                    >
+                      <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path></svg>
+                    </button>
+                  );
+                })()}
+
+                {showNotices && noticeStep === 3 && (
+                  <div className="absolute top-full left-0 mt-3 w-80 bg-[#13111c] border-2 border-amber-500/80 text-white rounded-xl p-3.5 shadow-[0_0_30px_rgba(245,158,11,0.4)] z-[3000] animate-fade-in select-none text-left text-xs font-medium">
+                    <div className="absolute -top-2.5 left-4 w-3.5 h-3.5 bg-[#13111c] border-t-2 border-l-2 border-amber-500/80 transform rotate-45" />
+
+                    {/* IMPORTANT WARNING HEADER BANNER */}
+                    <div className="bg-amber-500/15 border border-amber-500/40 rounded-lg px-2.5 py-1.5 mb-2.5 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-amber-400 font-black text-[11px] uppercase tracking-wider">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 animate-bounce shrink-0" />
+                        <span>IMPORTANT WARNING</span>
+                      </div>
+                      <button
+                        onClick={closeNotices}
+                        className="px-2 py-0.5 text-[10px] text-neutral-300 hover:text-white bg-white/10 hover:bg-red-500/80 rounded-md transition-all cursor-pointer shrink-0 font-sans font-bold flex items-center gap-1 border border-white/10"
+                        title="Close Notifications"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Close</span>
+                      </button>
+                    </div>
+
+                    <div className="mb-2 text-[10px] font-bold text-amber-300 bg-amber-500/10 px-2 py-1 rounded-md border border-amber-500/20 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                      <span>You need to read this only once</span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-[10px] text-[var(--accent-color)] font-mono font-bold uppercase tracking-wider">
+                      <Shield className="w-3.5 h-3.5" />
+                      <span>Tip 4 of 4 • Decoy Mask</span>
+                    </div>
+
+                    <p className="mt-2 text-[11px] leading-relaxed text-neutral-200 font-semibold">
+                      This is the name of the website that is shown in GoGuardian, helps mask your history in GoGuardian's timeline but please make sure not everyone is on the same decoy.
+                    </p>
+
+                    <div className="mt-3 pt-2 border-t border-white/10 flex items-center justify-between text-[10px]">
+                      <span className="flex items-center gap-1 text-amber-400 font-mono font-bold">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                        {noticeCountdown}s
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={prevNoticeStep}
+                          className="px-2 py-0.5 rounded bg-white/10 hover:bg-white/20 text-neutral-200 transition-colors cursor-pointer font-sans"
+                        >
+                          ← Prev
+                        </button>
+                        <button
+                          onClick={closeNotices}
+                          className="px-2.5 py-1 rounded bg-red-500 hover:bg-red-600 text-white font-black transition-all cursor-pointer font-sans shadow-md flex items-center gap-1"
+                          title="Close notifications"
+                        >
+                          <X className="w-3 h-3" />
+                          <span>Close ✓</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/10 rounded-b-xl overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 transition-all duration-1000 ease-linear"
+                        style={{ width: `${(noticeCountdown / 20) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {/* Quick Exit & Open Separately buttons for Workspaces (Main) */}
+              <AnimatePresence>
+                {(filter === 'movies' || filter === 'chat' || filter === 'youtube' || filter === 'lobbychat' || filter === 'download') && (
+                  <motion.div 
+                    key="workspace-actions-main"
+                    initial={{ opacity: 0, scale: 0.95 }}
+                    animate={{ opacity: 1, scale: 1 }}
+                    exit={{ opacity: 0, scale: 0.95 }}
+                    transition={{ duration: 0.15, ease: "easeOut" }}
+                    className="flex items-center gap-1.5 pl-2 ml-1 border-l border-[var(--card-border)]/50 whitespace-nowrap"
+                  >
+                    <button
+                      onClick={() => setFilter('all')}
+                      className="p-1.5 rounded-lg border border-rose-500/40 hover:border-rose-500 bg-rose-500/10 text-rose-500 hover:text-white hover:bg-rose-500 transition-all cursor-pointer flex items-center justify-center shrink-0 group"
+                      title="Close Workspace"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </motion.div>
+                )}
+              </AnimatePresence>
+            </div>
+          </div>
+
+          {/* Top Right: Combined Animations & Settings, plus Theme Slider */}
+          <div ref={compactRightRef} className="flex items-center gap-1.5 justify-end shrink-0 min-w-0 ml-auto z-10">{/* Combined Animations & Settings Group */}
+            <div className="relative flex items-center gap-2 border border-[var(--card-border)] bg-[var(--bg-secondary)] px-2.5 py-1 rounded-full shadow-sm shrink-0">
+              {/* Animations Slider */}
+              <div
+                id="header-animations-slider"
+                onClick={toggleAnimations}
+                className="flex items-center gap-1.5 cursor-pointer select-none group"
+                title={animationsEnabled ? "Animations Enabled (Click to toggle OFF for Chromebooks)" : "Animations Disabled (Click to toggle ON)"}
+                role="switch"
+                aria-checked={animationsEnabled}
+                aria-label="Toggle Animations"
+              >
+                <span 
+                  className={`tracking-tight transition-colors whitespace-nowrap ${mode === 'light' ? 'text-black font-extrabold' : 'text-[var(--text-primary)]'}`}
+                  style={{ fontFamily: 'Plus Jakarta Sans, sans-serif', fontSize: '8px', fontWeight: 'bold', color: mode === 'light' ? '#000000' : undefined }}
+                >
+                  Anim
+                </span>
+                <div 
+                  className={`relative w-7 h-4 rounded-full border transition-all duration-200 flex items-center px-0.5 ${
+                    animationsEnabled 
+                      ? mode === 'light' ? 'bg-black border-black' : 'bg-[var(--accent-color)] border-[var(--accent-color)]' 
+                      : mode === 'light' ? 'bg-neutral-200 border-neutral-300' : 'bg-[var(--input-fill)] border-[var(--card-border)]'
+                  }`}
+                >
+                  <div 
+                    className={`w-3 h-3 rounded-full transition-all duration-200 ease-out transform ${
+                      animationsEnabled 
+                        ? mode === 'light' ? 'translate-x-3 bg-white' : 'translate-x-3 bg-[var(--bg-color)]' 
+                        : mode === 'light' ? 'translate-x-0 bg-black' : 'translate-x-0 bg-[var(--text-muted)]'
+                    }`}
+                  />
+                </div>
+              </div>
+
+              {/* Subtle divider */}
+              <div className="w-px h-3.5 bg-[var(--card-border)]/60" />
+
+              {/* Settings Gear Button */}
+              <button
+                onClick={() => setIsGlobalSettingsOpen(!isGlobalSettingsOpen)}
+                className={`p-1 rounded-md transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                  mode === 'light' 
+                    ? 'text-black hover:text-black hover:bg-black/5' 
+                    : 'text-[var(--text-muted)] hover:text-[var(--accent-color)] hover:bg-[var(--card-bg)]'
+                }`}
+                title="System Settings"
+              >
+                <Settings className="w-3 h-3" style={{ color: mode === 'light' ? '#000000' : undefined }} />
+              </button>
+
+              {/* Download website button */}
+              <div className="relative">
+                <button
+                  onClick={downloadEntireWebsite}
+                  className={`p-1 rounded-md transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                    mode === 'light'
+                      ? 'text-black hover:text-black hover:bg-black/5'
+                      : 'text-[var(--text-muted)] hover:text-[var(--accent-color)] hover:bg-[var(--card-bg)]'
+                  } ${showNotices && noticeStep === 0 ? 'ring-2 ring-[var(--accent-color)] ring-offset-2 ring-offset-[#0d0d12] animate-pulse' : ''}`}
+                  title="Download Website"
+                  aria-label="Download Website"
+                >
+                  <Download className="w-3.5 h-3.5" style={{ color: mode === 'light' ? '#000000' : undefined }} />
+                </button>
+
+                {showNotices && noticeStep === 0 && (
+                  <div className="absolute top-full right-0 mt-3 w-80 bg-[#13111c] border-2 border-amber-500/80 text-white rounded-xl p-3.5 shadow-[0_0_30px_rgba(245,158,11,0.4)] z-[3000] animate-fade-in select-none text-left text-xs font-medium">
+                    {/* Pointer arrow pointing UP to download icon */}
+                    <div className="absolute -top-2.5 right-2.5 w-3.5 h-3.5 bg-[#13111c] border-t-2 border-l-2 border-amber-500/80 transform rotate-45" />
+
+                    {/* IMPORTANT WARNING HEADER BANNER */}
+                    <div className="bg-amber-500/15 border border-amber-500/40 rounded-lg px-2.5 py-1.5 mb-2.5 flex items-center justify-between gap-2">
+                      <div className="flex items-center gap-1.5 text-amber-400 font-black text-[11px] uppercase tracking-wider">
+                        <AlertTriangle className="w-4 h-4 text-amber-400 animate-bounce shrink-0" />
+                        <span>IMPORTANT WARNING</span>
+                      </div>
+                      <button
+                        onClick={closeNotices}
+                        className="px-2 py-0.5 text-[10px] text-neutral-300 hover:text-white bg-white/10 hover:bg-red-500/80 rounded-md transition-all cursor-pointer shrink-0 font-sans font-bold flex items-center gap-1 border border-white/10"
+                        title="Close Notifications"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                        <span>Close</span>
+                      </button>
+                    </div>
+
+                    <div className="mb-2 text-[10px] font-bold text-amber-300 bg-amber-500/10 px-2 py-1 rounded-md border border-amber-500/20 flex items-center gap-1.5">
+                      <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                      <span>You need to read this only once</span>
+                    </div>
+
+                    <div className="flex items-center gap-1.5 text-[10px] text-[var(--accent-color)] font-mono font-bold uppercase tracking-wider">
+                      <Download className="w-3.5 h-3.5" />
+                      <span>Tip 1 of 4 • Offline Website</span>
+                    </div>
+
+                    <p className="mt-2 text-[11px] leading-relaxed text-neutral-200 font-semibold">
+                      You can download the entire games website into a single file that go guardian can't block for everyone.
+                    </p>
+
+                    <div className="mt-3 pt-2 border-t border-white/10 flex items-center justify-between text-[10px]">
+                      <span className="flex items-center gap-1 text-amber-400 font-mono font-bold">
+                        <span className="w-1.5 h-1.5 rounded-full bg-amber-400 animate-ping" />
+                        {noticeCountdown}s
+                      </span>
+                      <div className="flex items-center gap-1.5">
+                        <button
+                          onClick={closeNotices}
+                          className="px-2.5 py-1 rounded bg-red-500/20 hover:bg-red-600 text-red-200 hover:text-white font-bold transition-all cursor-pointer font-sans border border-red-500/40 flex items-center gap-1"
+                          title="Close notifications"
+                        >
+                          <X className="w-3 h-3" />
+                          <span>Close</span>
+                        </button>
+                        <button
+                          onClick={nextNoticeStep}
+                          className="px-2.5 py-1 rounded bg-amber-500 hover:bg-amber-400 text-black font-black transition-all cursor-pointer font-sans shadow-md"
+                        >
+                          Next →
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Animated Progress bar at bottom */}
+                    <div className="absolute bottom-0 left-0 right-0 h-1 bg-white/10 rounded-b-xl overflow-hidden">
+                      <div
+                        className="h-full bg-amber-500 transition-all duration-1000 ease-linear"
+                        style={{ width: `${(noticeCountdown / 20) * 100}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {isGlobalSettingsOpen && (
+                <div className="absolute top-full right-0 mt-2 w-72 max-h-[85vh] overflow-y-auto bg-[#12121a] border border-white/10 rounded-xl p-4 shadow-2xl z-[99999] select-none text-left animate-fade-in no-scrollbar">
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                      <span className="text-[10px] font-black uppercase tracking-wider text-neutral-400">System Settings</span>
+                      <button onClick={() => setIsGlobalSettingsOpen(false)} className="text-neutral-400 hover:text-white cursor-pointer">
+                        <X className="w-3 h-3" />
+                      </button>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <span className="text-xs font-bold text-white">Sign Out On Close</span>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-400 leading-normal max-w-[150px]">
+                          Automatically lock workspace when tab or window is closed.
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !autoLockOnClose;
+                            setAutoLockOnClose(newVal);
+                            safeStorage.setItem('unblocked-auto-lock-on-close', String(newVal));
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Sign Out On Close"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              autoLockOnClose ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-2">
+                      <span className="text-xs font-bold text-white">Emergency Panic Keys</span>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-400 leading-normal max-w-[150px]">
+                          Enable emergency exit keys ([, ], `, \, Double Escape).
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !panicKeysEnabled;
+                            setPanicKeysEnabled(newVal);
+                            safeStorage.setItem('unblocked-panic-keys-enabled', String(newVal));
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Emergency Panic Keys"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              panicKeysEnabled ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-2">
+                      <span className="text-xs font-bold text-white">Auto Hide Header</span>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-400 leading-normal max-w-[150px]">
+                          Automatically hide header when launching a portal.
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !autoHideHeader;
+                            setAutoHideHeader(newVal);
+                            safeStorage.setItem('unblocked-auto-hide-header', String(newVal));
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Auto Hide Header"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              autoHideHeader ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                          <History className="w-3.5 h-3.5 text-[var(--accent-color)]" />
+                          History Masking
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !historyMaskingEnabled;
+                            setHistoryMaskingEnabled(newVal);
+                            safeStorage.setItem('unblocked-history-masking', String(newVal));
+                            if (newVal && typeof window !== 'undefined') {
+                              try {
+                                window.history.replaceState({ disguise: 'educational_workspace' }, document.title, window.location.pathname || '/');
+                              } catch (e) {}
+                            }
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Browser History Masking (replaceState)"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              historyMaskingEnabled ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                      <span className="text-[10px] text-neutral-400 leading-normal">
+                        Prevents portal titles and sub-paths from accumulating in browser history via <code className="text-[var(--accent-color)] font-mono">history.replaceState()</code>.
+                      </span>
+                    </div>
+
+                    {/* Download & Notification options */}
+                    <div className="pt-2 border-t border-white/5 flex flex-col gap-1.5">
+                      <button
+                        onClick={() => {
+                          downloadEntireWebsite();
+                          setIsGlobalSettingsOpen(false);
+                        }}
+                        className="w-full flex items-center justify-between p-2 rounded-lg bg-white/5 hover:bg-[var(--accent-color)]/20 hover:border-[var(--accent-color)] border border-white/10 text-white text-xs font-semibold transition-all cursor-pointer group"
+                        title="Download Website"
+                      >
+                        <span className="flex items-center gap-2">
+                          <Download className="w-3.5 h-3.5 text-[var(--accent-color)] group-hover:scale-110 transition-transform" />
+                          <span>Download Website</span>
+                        </span>
+                      </button>
+                    </div>
+
+                  </div>
+                </div>
+              )}
+
+              <button
+                onClick={() => setViewModeAndSave('articles')}
+                className={`p-1 rounded-md transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                  mode === 'light'
+                    ? 'text-black hover:text-black hover:bg-black/5'
+                    : 'text-[var(--text-muted)] hover:text-red-500 hover:bg-[var(--card-bg)]'
+                }`}
+                title="Sign Out (Lock Workspace)"
+              >
+                <LogOut className="w-3 h-3" style={{ color: mode === 'light' ? '#000000' : undefined }} />
+              </button>
+
+              <div className="w-[1px] h-3 bg-[var(--card-border)]/80" />
+
+              {/* Colors picker dots */}
+              <div className="flex items-center gap-1 px-0.5">
+                {[
+                  { key: 'cyborg', color: 'bg-green-500 border-green-300 shadow-[0_0_5px_green]', tooltip: 'Cyborg Theme' },
+                  { key: 'sunset', color: 'bg-amber-500 border-amber-300', tooltip: 'Sunset Theme' },
+                  { key: 'midnight', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Midnight Theme' },
+                  { key: 'forest', color: 'bg-emerald-500 border-emerald-300', tooltip: 'Forest Theme' },
+                  { key: 'violet', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Violet Theme' },
+                  { key: 'ice', color: 'bg-sky-400 border-sky-300', tooltip: 'Glacier Theme' },
+                  { key: 'rose-pine', color: 'bg-rose-300 border-rose-200', tooltip: 'Rose Pine Theme' },
+                  { key: 'none', color: 'bg-gradient-to-br from-neutral-300 to-neutral-700 border-neutral-400', tooltip: 'No Theme (Monochrome)' }
+                ].map((themeOpt) => (
+                  <button
+                    key={themeOpt.key}
+                    title={themeOpt.tooltip}
+                    onClick={() => setTheme(themeOpt.key)}
+                    className={`w-2 h-2 rounded-full ${themeOpt.color} border border-transparent transition-all duration-200 hover:scale-125 cursor-pointer ${
+                      theme === themeOpt.key ? 'ring-1 ring-offset-1 ring-[var(--accent-color)]' : 'opacity-60 hover:opacity-100'
+                    }`}
+                  />
+                ))}
+              </div>
+
+              {/* Subtle divider */}
+              <div className="w-[1px] h-3 bg-[var(--card-border)]/80" />
+
+              {/* Light/Dark slider with GoGuardian Decoy notice (Joined with color palette bar) */}
+              <div className="relative flex items-center gap-1">
+                {isWhiteDecoy && (
+                  <button
+                    type="button"
+                    onClick={() => setShowGoGuardianNotice(prev => !prev)}
+                    className={`p-0.5 rounded-full text-amber-500 hover:scale-120 transition-all cursor-pointer ${
+                      showGoGuardianNotice ? 'opacity-100 ring-2 ring-amber-500/40 bg-amber-500/10' : 'opacity-80 hover:opacity-100'
+                    }`}
+                    title="GoGuardian Decoy Shield Notice (Click to open/close)"
+                  >
+                    <Shield className="w-3.5 h-3.5 fill-amber-500/20" style={{ color: '#000000' }} />
+                  </button>
+                )}
+
+                <div 
+                  onClick={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
+                  className="relative w-[34px] h-4 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 select-none transition-all duration-300 shrink-0"
+                  title="Slide to change Light/Dark Mode"
+                >
+                  <div 
+                    className={`w-3 h-3 rounded-full bg-[var(--accent-color)] shadow-sm transition-all duration-300 ease-out flex items-center justify-center text-[7px] transform ${
+                      mode === 'dark' ? 'translate-x-4' : 'translate-x-0'
+                    }`}
+                  >
+                    {mode === 'dark' ? '🌙' : '☀️'}
+                  </div>
+                </div>
+
+                <AnimatePresence>
+                  {isWhiteDecoy && showGoGuardianNotice && (
+                    <GoGuardianDecoyNotice
+                      mode={mode}
+                      onToggleMode={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
+                      onClose={() => setShowGoGuardianNotice(false)}
+                      decoyType={decoyType}
+                      positionClass="absolute top-full right-0 mt-3 w-48 sm:w-56"
+                    />
+                  )}
+                </AnimatePresence>
+              </div>
+            </div>
+
+            </div>
+
+        </div>
+      )}
+          </motion.header>
+        )}
+      </AnimatePresence>
 
       {/* ALT LINKS BAR */}
-      <section className="bg-[var(--bg-secondary)] border-b border-[var(--card-border)] py-3 px-4 md:px-6 transition-colors duration-300">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
+      {headerOpen && altBarOpen && filter !== 'info' && (
+        <section className="bg-[var(--bg-secondary)] border-b border-[var(--card-border)] py-3 px-4 md:px-6 transition-colors duration-300 animate-fade-in">
+        <div className="w-full flex flex-col md:flex-row items-start md:items-center justify-between gap-3">
           {/* Alt Links Removed */}
 
           <div className="flex flex-wrap items-center gap-2 md:ml-auto w-full md:w-auto overflow-visible">
             {/* Go back to games back button */}
-            {(filter === 'chat' || filter === 'movies') && (
+            {(filter === 'chat' || filter === 'movies' || filter === 'youtube' || filter === 'lobbychat' || filter === 'download') && (
               <button
                 id="chat-back-button"
                 onClick={() => setFilter('all')}
                 className="flex items-center gap-1.5 text-xs font-mono font-bold py-1.5 px-3.5 rounded-full border border-[var(--card-border)] bg-[var(--card-bg)] text-[var(--text-primary)] hover:border-[var(--accent-color)] hover:text-[var(--accent-color)] transition-all cursor-pointer shadow-[0_2px_8.5px_rgba(0,0,0,0.1)] active:scale-98"
-                title="Go back to games list"
+                title="Go back to portals list"
                 aria-label="Back"
               >
                 <ArrowLeft className="w-3.5 h-3.5 text-[var(--accent-color)]" />
-                <span>Go back to games</span>
+                <span>Go back to portals</span>
               </button>
             )}
 
@@ -1892,466 +4534,348 @@ if (iconUrl.includes('.ico')) {
               <span>Movies</span>
             </button>
 
-            {/* AI Socratic Tutor button */}
-            <button
-              onClick={() => { setFilter(filter === 'chat' ? 'all' : 'chat'); setSelectedGame(null); }}
-              className={`text-xs border py-1.5 px-3.5 rounded-full font-mono font-bold flex items-center gap-1.5 cursor-pointer shadow-[0_2px_8.5px_rgba(0,0,0,0.1)] transition-all duration-200 active:scale-98 ${
-                filter === 'chat'
-                  ? 'bg-[var(--accent-color)] text-[var(--bg-color)] border-[var(--accent-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-extrabold'
-                  : 'bg-[var(--card-bg)] text-[var(--text-primary)] border-[var(--card-border)] hover:border-[var(--accent-color)] hover:text-[var(--accent-color)]'
-              }`}
-              title="Toggle AI Socratic Tutor - Ask Study/Academic Questions"
-            >
-              <MessageSquare className="w-3.5 h-3.5 text-[var(--accent-color)]" />
-              <span>GEMINI AI / GROQ AI</span>
-            </button>
-
-            {/* Suffix Select */}
-            <div className="flex items-center bg-[var(--card-bg)] border border-[var(--card-border)] rounded-full px-2.5 py-1.5 text-xs text-[var(--text-muted)] font-mono shadow-sm">
-              <span className="text-[10px] uppercase font-extrabold mr-1.5 text-[var(--accent-color)]">Tab Target:</span>
-              <select 
-                value={aboutBlankSuffix}
-                onChange={(e) => setAboutBlankSuffix(e.target.value)}
-                className="bg-transparent border-none outline-none font-bold text-[var(--text-primary)] cursor-pointer py-0.5"
-                style={{ colorScheme: mode }}
-              >
-                <option value="" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank (Default)</option>
-                <option value="#1" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#1</option>
-                <option value="#2" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#2</option>
-                <option value="#3" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#3</option>
-                <option value="#4" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#4</option>
-                <option value="#5" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#5</option>
-                <option value="#math" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#math</option>
-                <option value="#science" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#science</option>
-                <option value="#grades" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#grades</option>
-                <option value="#classroom" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#classroom</option>
-                <option value="#clever" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#clever</option>
-                <option value="#campus" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#campus</option>
-                <option value="#dashboard" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>about:blank#dashboard</option>
-              </select>
-            </div>
-
-            <button
-              onClick={() => {
-                const targetUrl = "about:blank" + aboutBlankSuffix;
-                const win = window.open(targetUrl, "_blank");
-                if (!win) {
-                  alert(`Popup blocked! Please allow popups to open the site in ${targetUrl}.`);
-                  return;
-                }
-                
-                // Construct query parameters to propagate the decoy state to the new document
-                const searchParams = new URLSearchParams(window.location.search);
-                searchParams.set('decoyType', decoyType);
-                const iframeSrc = `${window.location.origin}${window.location.pathname}?${searchParams.toString()}${window.location.hash}`;
-
-                const bookSvgDataUri = `data:image/svg+xml;utf8,${encodeURIComponent(
-                  `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23f97316" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h15M6 10h15"/></svg>`
-                )}`;
-
-                let parentTitle = "StudyTools";
-                let parentFavicon = bookSvgDataUri;
-                
-                if (decoyType === 'classroom') {
-                  parentTitle = "Home - Classroom";
-                  parentFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
-                } else if (decoyType === 'clever') {
-                  parentTitle = "Clever | Log in with Clever";
-                  parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=clever.com";
-                } else if (decoyType === 'campus') {
-                  parentTitle = "Campus Student";
-                  parentFavicon = "https://jerseycitynj.infinitecampus.org/campus/favicon-32x32.png";
-                } else if (decoyType === 'docs') {
-                  parentTitle = "Google Docs";
-                  parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=docs.google.com";
-                } else if (decoyType === 'gmail') {
-                  parentTitle = "Inbox - Jersey City Public Schools";
-                  parentFavicon = "https://www.google.com/s2/favicons?sz=64&domain=mail.google.com";
-                }
-
-                win.document.write(`
-                  <!DOCTYPE html>
-                  <html>
-                  <head>
-                    <title>${parentTitle}</title>
-                    <link rel="icon" type="image/png" href="${parentFavicon}">
-                    <meta charset="utf-8">
-                    <style>
-                      html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #0c0a09; }
-                      iframe { width: 100vw; height: 100vh; border: none; display: block; }
-                    </style>
-                  </head>
-                  <body>
-                    <iframe src="${iframeSrc}" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
-                  </body>
-                  </html>
-                `);
-                win.document.close();
-
-                // Set location hash after writing to force browser to register hash parameter in address bar
-                try {
-                  if (aboutBlankSuffix) {
-                    win.location.hash = aboutBlankSuffix;
-                  }
-                } catch (e) {
-                  // ignore
-                }
-              }}
-              className="text-xs bg-[var(--card-bg)] text-[var(--text-primary)] border border-[var(--card-border)] py-1.5 px-3.5 rounded-full hover:border-[var(--accent-color)] hover:text-[var(--accent-color)] active:scale-98 transition-all duration-200 font-mono font-bold flex items-center gap-1.5 cursor-pointer shadow-sm"
-              title="Open entire site inside about:blank tab with selected suffix to cloak history"
-            >
-              <Globe className="w-3.5 h-3.5 text-[var(--accent-color)] animate-spin-slow" />
-              <span>CLOAK IN {aboutBlankSuffix ? `ABOUT:BLANK ${aboutBlankSuffix.toUpperCase()}` : 'ABOUT:BLANK'}</span>
-            </button>
-
             {/* Decoy Mode Selector */}
-            <div className={`flex items-center border rounded-full px-3 py-1.5 text-xs font-mono shadow-sm transition-all duration-300 ${
-              decoyType !== 'none' 
-                ? 'bg-[var(--accent-color)]/10 border-[var(--accent-color)] text-[var(--accent-color)]' 
-                : 'bg-[var(--card-bg)] border-[var(--card-border)] text-[var(--text-muted)]'
-            }`}>
-              <span className="text-[10px] uppercase font-extrabold mr-1.5 flex items-center gap-1">
-                <School className="w-3.5 h-3.5 animate-pulse" />
-                <span>Decoy:</span>
-              </span>
-              <select 
-                value={decoyType}
-                onChange={(e) => setDecoyType(e.target.value)}
-                className={`bg-transparent border-none outline-none font-bold cursor-pointer py-0.5 ${
-                  decoyType !== 'none' ? 'text-[var(--accent-color)]' : 'text-[var(--text-primary)]'
-                }`}
-                style={{ colorScheme: mode }}
-              >
-                <option value="none" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>Off (StudyTools)</option>
-                <option value="classroom" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>Google Classroom</option>
-                <option value="clever" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>Clever Login</option>
-                <option value="campus" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>Infinite Campus</option>
-                <option value="docs" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>Google Docs</option>
-                <option value="gmail" style={{ backgroundColor: 'var(--card-bg)', color: 'var(--text-primary)' }}>Inbox - Jersey City Public Schools</option>
-              </select>
+            <div className="flex items-center gap-1.5">
+              <span className="text-[10px] font-mono font-bold text-neutral-400 uppercase select-none">Decoy:</span>
+              <DecoyDropdown value={decoyType} onChange={setDecoyType} mode={mode} />
+              <AutoRandomizeDecoyButton
+                autoRandomize={autoRandomizeDecoy}
+                setAutoRandomize={setAutoRandomizeDecoy}
+                interval={randomizeInterval}
+                setInterval={updateRandomizeInterval}
+                pool={randomizePool}
+                togglePoolItem={toggleDecoyInPool}
+                selectAllPool={selectAllDecoys}
+                countdown={randomizeCountdown}
+                onRandomizeNow={triggerManualRandomize}
+                currentDecoy={decoyType}
+                mode={mode}
+              />
             </div>
-          </div>
+
+            {/* Alt Bar Search Bar (squishable, left of Clear History) */}
+            <div className="w-28 sm:w-36 md:w-44 shrink transition-all duration-300 min-w-[70px]">
+              <div className="relative flex items-center w-full">
+                <Search className="absolute left-2.5 w-3 h-3 text-[var(--accent-color)] pointer-events-none shrink-0" />
+                <input
+                  type="text"
+                  placeholder="Search portals..."
+                  value={searchQuery}
+                  onChange={(e) => setSearchQuery(e.target.value)}
+                  className="w-full bg-[var(--card-bg)] border border-[var(--card-border)] hover:border-[var(--accent-color)]/50 focus:border-[var(--accent-color)] text-[var(--text-primary)] text-xs rounded-lg pl-7 pr-6 py-1 outline-none transition-all duration-200 placeholder:text-[var(--text-muted)]/60 min-w-0"
+                />
+                {searchQuery && (
+                  <button
+                    onClick={() => setSearchQuery('')}
+                    className="absolute right-2 p-0.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] transition-colors cursor-pointer"
+                    title="Clear search"
+                  >
+                    <X className="w-2.5 h-2.5" />
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Animations Slider in Alt Bar (Compact & Simplified for Chromebooks, Full White with Black Dot when ON) */}
+            <div
+              id="alt-bar-animations-slider"
+              onClick={toggleAnimations}
+              className="flex items-center gap-2 px-2.5 py-1 border border-[var(--card-border)] bg-[var(--bg-secondary)] hover:border-neutral-500 rounded-full shadow-sm cursor-pointer select-none transition-all group shrink-0"
+              title={animationsEnabled ? "Animations Enabled (Click to toggle OFF for Chromebooks)" : "Animations Disabled (Click to toggle ON)"}
+              role="switch"
+              aria-checked={animationsEnabled}
+              aria-label="Toggle Animations"
+            >
+              <span className={`text-[10px] font-mono font-bold tracking-tight transition-colors whitespace-nowrap ${mode === 'light' ? 'text-black font-extrabold' : 'text-[var(--text-primary)]'}`} style={{ color: mode === 'light' ? '#000000' : undefined }}>
+                Animations
+              </span>
+              <div 
+                className={`relative w-7 h-4 rounded-full border transition-all duration-200 flex items-center px-0.5 ${
+                  animationsEnabled 
+                    ? mode === 'light' ? 'bg-black border-black' : 'bg-[var(--accent-color)] border-[var(--accent-color)]' 
+                    : mode === 'light' ? 'bg-neutral-200 border-neutral-300' : 'bg-[var(--input-fill)] border-[var(--card-border)]'
+                }`}
+              >
+                <div 
+                  className={`w-3 h-3 rounded-full transition-all duration-200 ease-out transform ${
+                    animationsEnabled 
+                      ? mode === 'light' ? 'translate-x-3 bg-white' : 'translate-x-3 bg-[var(--bg-color)]' 
+                      : mode === 'light' ? 'translate-x-0 bg-black' : 'translate-x-0 bg-[var(--text-muted)]'
+                  }`}
+                />
+              </div>
+            </div>{/* Unified Settings, Colors & Sign Out Group */}
+            <div className="relative flex items-center gap-2 border border-[var(--card-border)] bg-[var(--bg-secondary)] p-1 rounded-full shadow-sm">
+              {/* Settings Gear Button (opens System Settings Dropdown) */}
+              <button
+                onClick={() => setIsGlobalSettingsOpen(!isGlobalSettingsOpen)}
+                className={`p-1.5 rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                  mode === 'light'
+                    ? 'text-black hover:text-black hover:bg-black/5'
+                    : 'text-[var(--text-muted)] hover:text-[var(--accent-color)] hover:bg-[var(--card-bg)]'
+                }`}
+                title="System Settings"
+              >
+                <Settings className="w-3.5 h-3.5" style={{ color: mode === 'light' ? '#000000' : undefined }} />
+              </button>
+
+              {/* Download website button */}
+              <div className="relative">
+                <button
+                  onClick={downloadEntireWebsite}
+                  className={`p-1.5 rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                    filter === 'download' 
+                      ? mode === 'light' ? 'bg-black text-white font-bold' : 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_2px_8px_var(--accent-shadow)] font-bold' 
+                      : mode === 'light' ? 'text-black hover:text-black hover:bg-black/5' : 'text-[var(--text-muted)] hover:text-[var(--accent-color)] hover:bg-[var(--card-bg)]'
+                  }`}
+                  title={filter === 'download' ? "Back to Portals" : "Download Website"}
+                  aria-label="Download Website"
+                >
+                  <Download className="w-3.5 h-3.5" style={{ color: mode === 'light' ? (filter === 'download' ? '#ffffff' : '#000000') : undefined }} />
+                </button>
+              </div>
+
+              {isGlobalSettingsOpen && (
+                <div className="absolute top-full right-0 mt-2 w-72 max-h-[85vh] overflow-y-auto bg-[#12121a] border border-white/10 rounded-xl p-4 shadow-2xl z-[99999] select-none text-left animate-fade-in no-scrollbar">
+                  <div className="flex flex-col gap-3">
+                    <div className="flex items-center justify-between border-b border-white/5 pb-2">
+                      <span className="text-[10px] font-black uppercase tracking-wider text-neutral-400">System Settings</span>
+                      <button onClick={() => setIsGlobalSettingsOpen(false)} className="text-neutral-400 hover:text-white cursor-pointer">
+                        <X className="w-3" style={{ height: '12px' }} />
+                      </button>
+                    </div>
+                    <div className="flex flex-col gap-2">
+                      <span className="text-xs font-bold text-white">Sign Out On Close</span>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-400 leading-normal max-w-[150px]">
+                          Automatically lock workspace when tab or window is closed.
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !autoLockOnClose;
+                            setAutoLockOnClose(newVal);
+                            safeStorage.setItem('unblocked-auto-lock-on-close', String(newVal));
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Sign Out On Close"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              autoLockOnClose ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-2">
+                      <span className="text-xs font-bold text-white">Emergency Panic Keys</span>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-400 leading-normal max-w-[150px]">
+                          Enable emergency exit keys ([, ], `, \, Double Escape).
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !panicKeysEnabled;
+                            setPanicKeysEnabled(newVal);
+                            safeStorage.setItem('unblocked-panic-keys-enabled', String(newVal));
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Emergency Panic Keys"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              panicKeysEnabled ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-2">
+                      <span className="text-xs font-bold text-white">Auto Hide Header</span>
+                      <div className="flex items-center justify-between">
+                        <span className="text-[10px] text-neutral-400 leading-normal max-w-[150px]">
+                          Automatically hide header when launching a portal.
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !autoHideHeader;
+                            setAutoHideHeader(newVal);
+                            safeStorage.setItem('unblocked-auto-hide-header', String(newVal));
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Auto Hide Header"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              autoHideHeader ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-col gap-2 border-t border-white/5 pt-2">
+                      <div className="flex items-center justify-between">
+                        <span className="text-xs font-bold text-white flex items-center gap-1.5">
+                          <History className="w-3.5 h-3.5 text-[var(--accent-color)]" />
+                          History Masking
+                        </span>
+                        <div
+                          onClick={() => {
+                            const newVal = !historyMaskingEnabled;
+                            setHistoryMaskingEnabled(newVal);
+                            safeStorage.setItem('unblocked-history-masking', String(newVal));
+                            if (newVal && typeof window !== 'undefined') {
+                              try {
+                                window.history.replaceState({ disguise: 'educational_workspace' }, document.title, window.location.pathname || '/');
+                              } catch (e) {}
+                            }
+                          }}
+                          className="relative w-[50px] h-6 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 transition-all duration-300 shrink-0"
+                          title="Toggle Browser History Masking (replaceState)"
+                        >
+                          <div 
+                            className={`w-5 h-5 rounded-full shadow-md transition-all duration-300 ease-out transform ${
+                              historyMaskingEnabled ? 'translate-x-6 bg-[var(--accent-color)]' : 'translate-x-0 bg-neutral-500'
+                            }`}
+                          />
+                        </div>
+                      </div>
+                      <span className="text-[10px] text-neutral-400 leading-normal">
+                        Prevents portal titles and sub-paths from accumulating in browser history via <code className="text-[var(--accent-color)] font-mono">history.replaceState()</code>.
+                      </span>
+                    </div>
+
+                    {/* Download & Notification options */}
+                    <div className="pt-2 border-t border-white/5 flex flex-col gap-1.5">
+                      <button
+                        onClick={() => {
+                          downloadEntireWebsite();
+                          setIsGlobalSettingsOpen(false);
+                        }}
+                        className="w-full flex items-center justify-between p-2 rounded-lg bg-white/5 hover:bg-[var(--accent-color)]/20 hover:border-[var(--accent-color)] border border-white/10 text-white text-xs font-semibold transition-all cursor-pointer group"
+                        title="Download Website"
+                      >
+                        <span className="flex items-center gap-2">
+                          <Download className="w-3.5 h-3.5 text-[var(--accent-color)] group-hover:scale-110 transition-transform" />
+                          <span>Download Website</span>
+                        </span>
+                      </button>
+                    </div>
+
+                  </div>
+                </div>
+              )}
+
+              <button
+                onClick={() => setViewModeAndSave('articles')}
+                className={`p-1.5 rounded-full transition-all cursor-pointer flex items-center justify-center shrink-0 ${
+                  mode === 'light'
+                    ? 'text-black hover:text-black hover:bg-black/5'
+                    : 'text-[var(--text-muted)] hover:text-red-500 hover:bg-[var(--card-bg)]'
+                }`}
+                title="Sign Out (Lock Workspace)"
+              >
+                <LogOut className="w-3.5 h-3.5" style={{ color: mode === 'light' ? '#000000' : undefined }} />
+              </button>
+
+              <div className="w-[1px] h-3.5 bg-[var(--card-border)]/80" />
+
+              {/* Colors picker dots */}
+              <div className="flex items-center gap-1 px-0.5">
+                {[
+                  { key: 'cyborg', color: 'bg-green-500 border-green-300 shadow-[0_0_5px_green]', tooltip: 'Cyborg Theme' },
+                  { key: 'sunset', color: 'bg-amber-500 border-amber-300', tooltip: 'Sunset Theme' },
+                  { key: 'midnight', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Midnight Theme' },
+                  { key: 'forest', color: 'bg-emerald-500 border-emerald-300', tooltip: 'Forest Theme' },
+                  { key: 'violet', color: 'bg-indigo-600 border-indigo-400', tooltip: 'Violet Theme' },
+                  { key: 'ice', color: 'bg-sky-400 border-sky-300', tooltip: 'Glacier Theme' },
+                  { key: 'rose-pine', color: 'bg-rose-300 border-rose-200', tooltip: 'Rose Pine Theme' },
+                  { key: 'none', color: 'bg-gradient-to-br from-neutral-300 to-neutral-700 border-neutral-400', tooltip: 'No Theme (Monochrome)' }
+                ].map((themeOpt) => (
+                  <button
+                    key={themeOpt.key}
+                    title={themeOpt.tooltip}
+                    onClick={() => setTheme(themeOpt.key)}
+                    className={`w-2 h-2 rounded-full ${themeOpt.color} border border-transparent transition-all duration-200 hover:scale-125 cursor-pointer ${
+                      theme === themeOpt.key ? 'ring-1 ring-offset-1 ring-[var(--accent-color)] scale-110' : 'opacity-60 hover:opacity-100'
+                    }`}
+                  />
+                ))}
+              </div>
+            </div>
+          
+
+            {/* Light/Dark Mode slider with GoGuardian indicator */}
+            <div className="relative flex items-center gap-1.5 border border-[var(--card-border)] bg-[var(--bg-secondary)] p-1 rounded-full shadow-sm">
+              {isWhiteDecoy && (
+                <button
+                  type="button"
+                  onClick={() => setShowGoGuardianNotice(prev => !prev)}
+                  className={`p-0.5 rounded-full text-amber-500 hover:scale-115 transition-all cursor-pointer ${
+                    showGoGuardianNotice ? 'opacity-100 ring-2 ring-amber-500/40 bg-amber-500/10' : 'opacity-80 hover:opacity-100'
+                  }`}
+                  title="GoGuardian Decoy Shield Notice (Click to open/close)"
+                >
+                  <Shield className="w-3 h-3 fill-amber-500/20" style={{ color: '#000000' }} />
+                </button>
+              )}
+
+              <div 
+                onClick={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
+                className="relative w-[38px] h-5 bg-[var(--input-fill)] border border-[var(--card-border)] rounded-full cursor-pointer flex items-center p-0.5 select-none transition-all duration-300"
+                title="Slide to change Mode"
+              >
+                <div 
+                  className={`w-3.5 h-3.5 rounded-full bg-[var(--accent-color)] shadow-sm transition-all duration-300 ease-out flex items-center justify-center text-[8px] transform ${
+                    mode === 'dark' ? 'translate-x-4' : 'translate-x-0'
+                  }`}
+                >
+                  {mode === 'dark' ? '🌙' : '☀️'}
+                </div>
+              </div>
+
+              <AnimatePresence>
+                {isWhiteDecoy && showGoGuardianNotice && (
+                  <GoGuardianDecoyNotice
+                    mode={mode}
+                    onToggleMode={() => setMode(prev => prev === 'light' ? 'dark' : 'light')}
+                    onClose={() => setShowGoGuardianNotice(false)}
+                    decoyType={decoyType}
+                    positionClass="absolute top-full right-0 mt-3 w-48 sm:w-56"
+                  />
+                )}
+              </AnimatePresence>
+            </div>
+
+            </div>
         </div>
       </section>
+      )}
 
-            {/* Hidden legacy frame creator to preserve large assets cleanly */}
-            <div style={{ display: 'none' }}>
-              <button
-                onClick={() => {
-                  const win = window.open("about:blank", "_blank");
-                  if (!win) {
-                    alert("Popup blocked! Accessing classroom decoys requires popup permissions.");
-                    return;
-                  }
-                win.document.write(`
-                  <!DOCTYPE html>
-                  <html>
-                  <head>
-                    <title>Classwork - Algebra II</title>
-                    <link rel="icon" type="image/png" href="https://ssl.gstatic.com/classroom/favicon.png">
-                    <meta charset="utf-8">
-                    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-                    <style>
-                      * { box-sizing: border-box; margin: 0; padding: 0; }
-                      html, body {
-                        width: 100vw;
-                        height: 100vh;
-                        overflow: hidden;
-                        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
-                        background-color: #ffffff;
-                        display: flex;
-                        flex-direction: column;
-                      }
-                      
-                      /* CLASSROOM HEADER */
-                      .classroom-header {
-                        height: 64px;
-                        background-color: #ffffff;
-                        border-bottom: 1px solid #e0e0e0;
-                        display: flex;
-                        align-items: center;
-                        justify-content: space-between;
-                        padding: 0 16px;
-                        position: relative;
-                        user-select: none;
-                      }
-                      
-                      .header-left { display: flex; align-items: center; gap: 12px; }
-                      
-                      .menu-btn {
-                        width: 48px;
-                        height: 48px;
-                        border-radius: 50%;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        cursor: pointer;
-                        color: #5f6368;
-                      }
-                      .menu-btn:hover { background-color: rgba(95, 99, 104, 0.04); }
-                      
-                      .classroom-logo { display: flex; align-items: center; gap: 8px; cursor: pointer; }
-                      .classroom-logo img { width: 24px; height: 24px; }
-                      .classroom-logo span {
-                        font-size: 22px;
-                        color: #5f6368;
-                        font-weight: 400;
-                        font-family: Arial, sans-serif;
-                      }
-                      
-                      .course-title-section {
-                        display: flex;
-                        align-items: center;
-                        gap: 8px;
-                        margin-left: 8px;
-                        border-left: 1px solid #dadce0;
-                        padding-left: 16px;
-                      }
-                      
-                      .course-title { font-size: 16px; color: #3c4043; font-weight: 500; }
-                      .course-section { font-size: 12px; color: #5f6368; }
-                      
-                      /* TABS */
-                      .header-middle {
-                        display: flex;
-                        align-items: center;
-                        gap: 24px;
-                        position: absolute;
-                        left: 50%;
-                        transform: translateX(-50%);
-                        height: 100%;
-                      }
-                      
-                      .tab {
-                        height: 100%;
-                        display: flex;
-                        align-items: center;
-                        padding: 0 8px;
-                        font-size: 14px;
-                        font-weight: 500;
-                        color: #5f6368;
-                        cursor: pointer;
-                        border-bottom: 3px solid transparent;
-                      }
-                      .tab:hover { color: #137333; background-color: rgba(19, 115, 51, 0.04); }
-                      .tab.active { color: #137333; border-bottom-color: #137333; }
-                      
-                      /* RIGHT SIDE */
-                      .header-right { display: flex; align-items: center; gap: 8px; }
-                      
-                      .icon-btn {
-                        width: 40px;
-                        height: 40px;
-                        border-radius: 50%;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        cursor: pointer;
-                        color: #5f6368;
-                      }
-                      .icon-btn:hover { background-color: rgba(95, 99, 104, 0.04); }
-                      
-                      .avatar {
-                        width: 32px;
-                        height: 32px;
-                        border-radius: 50%;
-                        background-color: #1a73e8;
-                        color: #ffffff;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
-                        font-size: 14px;
-                        font-weight: 500;
-                        margin-left: 8px;
-                        cursor: pointer;
-                      }
-                      
-                      /* MAIN CONTENT */
-                      .main-body {
-                        flex: 1;
-                        position: relative;
-                        width: 100%;
-                        height: calc(100vh - 64px);
-                        background-color: #ffffff;
-                      }
-                      
-                      iframe { width: 100%; height: 100%; border: none; display: block; }
-                      
-                      .decoy-content {
-                        position: absolute;
-                        top: 0;
-                        left: 0;
-                        width: 100%;
-                        height: 100%;
-                        background-color: #ffffff;
-                        display: none;
-                        padding: 32px;
-                        overflow-y: auto;
-                      }
-                      
-                      .decoy-active #game-iframe { display: none; }
-                      .decoy-active .decoy-content { display: block; }
-                    </style>
-                  </head>
-                  <body>
-                    <!-- Header -->
-                    <div class="classroom-header">
-                      <div class="header-left">
-                        <div class="menu-btn" id="menu-btn-click">
-                          <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-                            <path d="M3 18h18v-2H3v2zm0-5h18v-2H3v2zm0-7v2h18V6H3z"/>
-                          </svg>
-                        </div>
-                        <div class="classroom-logo" id="brand-logo-click">
-                          <img src="https://ssl.gstatic.com/classroom/favicon.png" alt="Classroom Logo">
-                          <span>Classroom</span>
-                        </div>
-                        <div class="course-title-section" id="course-banner-click" style="cursor: pointer;">
-                          <div class="course-title">Algebra II</div>
-                          <div class="course-section">&nbsp;- Honors Period 3</div>
-                        </div>
-                      </div>
-                      
-                      <div class="header-middle">
-                        <div class="tab">Stream</div>
-                        <div class="tab active">Classwork</div>
-                        <div class="tab">People</div>
-                        <div class="tab">Grades</div>
-                      </div>
-                      
-                      <div class="header-right">
-                        <div class="icon-btn">
-                          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-                            <path d="M20 18H4v-7h16v7zm1-9h-3V6c0-1.1-.9-2-2-2H8c-1.1 0-2 .9-2 2v3H3c-1.1 0-2 .9-2 2v9c0 1.1.9 2 2 2h18c1.1 0-2-.9-2-2v-9c0-1.1-.9-2-2-2zm-3-3v3H8V6h10z"/>
-                          </svg>
-                        </div>
-                        <div class="icon-btn">
-                          <svg viewBox="0 0 24 24" width="20" height="20" fill="currentColor">
-                            <path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 17h-2v-2h2v2zm2.07-7.75l-.9.92C13.45 12.9 13 13.5 13 15h-2v-.5c0-1.1.45-2.1 1.17-2.83l1.24-1.26c.37-.36.59-.86.59-1.41 0-1.1-.9-2-2-2s-2 .9-2 2H7c0-2.76 2.24-5 5-5s5 2.24 5 5c0 1.04-.42 1.99-1.07 2.75z"/>
-                          </svg>
-                        </div>
-                        <div class="icon-btn" style="margin-right: 4px;">
-                          <svg viewBox="0 0 24 24" width="24" height="24" fill="currentColor">
-                            <path d="M12 8c1.1 0 2-.9 2-2s-.9-2-2-2-2 .9-2 2 .9 2 2 2zm0 2c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2zm0 6c-1.1 0-2 .9-2 2s.9 2 2 2 2-.9 2-2-.9-2-2-2z"/>
-                          </svg>
-                        </div>
-                        <div class="avatar">S</div>
-                      </div>
-                    </div>
-                    
-                    <!-- Main Body Area -->
-                    <div class="main-body" id="main-body">
-                      <iframe id="game-iframe" src="${window.location.origin}${window.location.pathname}${window.location.search}" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
-                      
-                      <!-- Decoy Homework Board -->
-                      <div class="decoy-content">
-                        <div style="background-color: #137333; color: white; padding: 24px 32px; border-radius: 8px; margin-bottom: 24px; text-align: left;">
-                          <h1 style="font-size: 26px; font-weight: 400; margin-bottom: 6px; font-family: Roboto, Arial, sans-serif;">Algebra II - Period 3 Homework & Resource Portal</h1>
-                          <p style="font-size: 14px; opacity: 0.9; font-family: Roboto, Arial, sans-serif;">Honors Mathematics Course Resources</p>
-                        </div>
-
-                        <div style="display: flex; gap: 24px; text-align: left; font-family: Roboto, Arial, sans-serif; flex-wrap: wrap;">
-                          <div style="flex: 2; min-width: 300px;">
-                            <div style="background: white; border: 1px solid #dadce0; border-radius: 8px; padding: 24px; margin-bottom: 24px;">
-                              <div style="display: flex; justify-content: space-between; border-bottom: 1px solid #dadce0; padding-bottom: 16px; margin-bottom: 16px; flex-wrap: wrap; gap: 12px;">
-                                <div>
-                                  <h2 style="font-size: 20px; font-weight: 500; color: #1967d2; margin-bottom: 4px;">Interactive Graphing Lab & Exercises</h2>
-                                  <p style="font-size: 12px; color: #5f6368;">Teacher: Mrs. Katherine Vance &bull; Assigned: Jun 4</p>
-                                </div>
-                                <div style="text-align: right; min-width: 120px;">
-                                  <p style="font-size: 14px; font-weight: 500; color: #3c4043;">100 points</p>
-                                  <p style="font-size: 12px; color: #c5221f; font-weight: 500;">Due Tomorrow, 11:59 PM</p>
-                                </div>
-                              </div>
-
-                              <p style="font-size: 14px; color: #3c4043; line-height: 1.6; margin-bottom: 16px;">
-                                Use the web interactive math sandbox or scientific plotter loaded below to map standard polynomial structures and quadratic graphs. Note the curves, intersections, and coordinates. Fill in the homework matrix PDF when complete.
-                              </p>
-                              
-                              <div style="border: 1px solid #dadce0; border-radius: 8px; overflow: hidden; height: 400px; margin-top: 16px; background-color: #f1f3f4;">
-                                <iframe src="https://www.desmos.com/calculator" style="width:100%; height:100%; border:0;" referrerpolicy="no-referrer"></iframe>
-                              </div>
-                            </div>
-                          </div>
-
-                          <div style="flex: 1; min-width: 240px; max-width: 300px;">
-                            <div style="background: white; border: 1px solid #dadce0; border-radius: 8px; padding: 20px; margin-bottom: 16px; box-shadow: 0 1px 2px rgba(0,0,0,0.05);">
-                              <h3 style="font-size: 16px; font-weight: 500; color: #3c4043; margin-bottom: 16px;">Your work</h3>
-                              <div style="border: 1px dashed #dadce0; border-radius: 4px; padding: 24px; text-align: center; margin-bottom: 16px; font-size: 12px; color: #5f6368;">
-                                No files attached
-                              </div>
-                              <button style="width: 100%; background: #1a73e8; color: white; border: none; border-radius: 4px; padding: 10px 16px; font-size: 14px; font-weight: 500; cursor: pointer; margin-bottom: 8px;">
-                                + Add or create
-                              </button>
-                              <button style="width: 100%; background: transparent; border: 1px solid #dadce0; color: #1a73e8; border-radius: 4px; padding: 10px 16px; font-size: 14px; font-weight: 500; cursor: pointer;">
-                                Mark as done
-                              </button>
-                            </div>
-
-                            <div style="background: white; border: 1px solid #dadce0; border-radius: 8px; padding: 16px;">
-                              <h3 style="font-size: 14px; font-weight: 500; color: #3c4043; margin-bottom: 8px;">Private comments</h3>
-                              <p style="font-size: 12px; color: #5f6368; margin-bottom: 8px;">Send a private comment to Mrs. Vance</p>
-                              <input placeholder="Add private comment..." style="width:100%; border: 1px solid #dadce0; padding: 8px 12px; font-size: 12px; border-radius: 4px; outline: none; box-sizing: border-box;" />
-                            </div>
-                          </div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <script>
-                      var isDecoy = false;
-                      function togglePanic() {
-                        isDecoy = !isDecoy;
-                        if (isDecoy) {
-                          document.getElementById('main-body').classList.add('decoy-active');
-                        } else {
-                          document.getElementById('main-body').classList.remove('decoy-active');
-                        }
-                      }
-                      
-                      // Esc key triggers emergency switch to real study material
-                      window.addEventListener('keydown', function(e) {
-                        if (e.key === 'Escape' || e.key === '\\x60') {
-                          togglePanic();
-                        }
-                      });
-                      
-                      // Clicking on banner/logo acts as interactive quick toggle
-                      document.getElementById('course-banner-click').addEventListener('click', togglePanic);
-                      document.getElementById('brand-logo-click').addEventListener('click', togglePanic);
-                      document.getElementById('menu-btn-click').addEventListener('click', togglePanic);
-                    </script>
-                  </body>
-                  </html>
-                `);
-                win.document.close();
-              }}
-              className="hidden"
-            >
-              <span>HIDDEN LEGACY BUTTON</span>
-            </button>
-            </div>
 
       {/* MAIN CONTAINER: SIDEBAR + GAMES */}
-      <div className={`flex-1 flex flex-col md:flex-row w-full mx-auto transition-all duration-300 ${
-        (filter === 'chat' || filter === 'movies')
-          ? 'max-w-none p-0 gap-0 border-t border-[var(--card-border)]/50 lg:bg-[#07090e]' 
+      <div className={`flex-1 flex flex-col md:flex-row w-full mx-auto relative select-none games-no-select ${windowFullscreen ? 'z-[99999]' : 'z-10'} ${
+        (filter === 'chat' || filter === 'movies' || filter === 'lobbychat' || filter === 'youtube' || filter === 'download' || filter === 'info' || selectedGame)
+          ? 'max-w-none p-0 gap-0 border-t-0 lg:bg-[#07090e]' 
           : 'max-w-8xl p-4 md:p-6 gap-6 self-center'
       }`}>
         
         {/* LEFT NAV PANEL - CAT SIDEBAR */}
-        {filter !== 'chat' && filter !== 'movies' && (
+        {filter !== 'chat' && filter !== 'movies' && filter !== 'youtube' && filter !== 'lobbychat' && filter !== 'download' && filter !== 'info' && !selectedGame && (
           <aside className={`transition-all duration-300 ease-in-out shrink-0 flex flex-col gap-2 overflow-hidden ${
-            sidebarOpen ? 'w-full md:w-64' : 'w-full md:w-14'
+            sidebarOpen ? 'w-full md:w-44' : 'w-full md:w-14'
           }`}>
             
             <div className="flex items-center justify-between px-2 py-1 min-h-[36px]">
               {sidebarOpen ? (
-                <span className="text-[10px] font-mono tracking-wider opacity-50 uppercase whitespace-nowrap">
+                <span className="text-[10px] font-mono tracking-wider text-[var(--text-muted)] uppercase whitespace-nowrap">
                   Browse Portals
                 </span>
               ) : (
-                <span className="hidden md:inline text-[9px] font-mono tracking-wider opacity-50 uppercase text-center mx-auto font-bold text-[var(--accent-color)]">
+                <span className="hidden md:inline text-[9px] font-mono tracking-wider uppercase text-center mx-auto font-bold text-[var(--accent-color)]">
                   NAV
                 </span>
               )}
@@ -2360,11 +4884,38 @@ if (iconUrl.includes('.ico')) {
                 className="p-1.5 rounded-lg hover:bg-[var(--card-bg)] text-[var(--accent-color)] transition-all duration-250 cursor-pointer flex items-center justify-center ml-auto"
                 title={sidebarOpen ? "Collapse sidebar" : "Expand sidebar"}
               >
-                {sidebarOpen ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4 animate-bounce" />}
+                {sidebarOpen ? <ChevronLeft className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
               </button>
             </div>
 
-            <button
+
+            <motion.button
+              whileHover={animationsEnabled ? { x: 6 } : undefined}
+              whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+              onClick={() => { setFilter('info'); setSelectedGame(null); setGameHeaderHidden(false); }}
+              className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
+                filter === 'info' 
+                  ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-lg shadow-[var(--accent-color)]/20' 
+                  : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
+              }`}
+            >
+              <Info className="w-4.5 h-4.5 shrink-0" />
+              <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Information</span>
+            </motion.button>
+
+            <motion.button
+              whileHover={animationsEnabled ? { x: 6 } : undefined}
+              whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+              onClick={() => { window.open('https://forms.gle/YCN8itY7WqmN82CY8', '_blank'); }}
+              className="w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80"
+            >
+              <ExternalLink className="w-4.5 h-4.5 shrink-0" />
+              <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Request a Portal</span>
+            </motion.button>
+
+            <motion.button
+              whileHover={{ x: 6 }}
+              whileTap={{ scale: 0.97 }}
               onClick={() => { setFilter('all'); setSelectedGame(null); }}
             className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
               filter === 'all' && !selectedGame
@@ -2374,9 +4925,11 @@ if (iconUrl.includes('.ico')) {
           >
             <Layers className="w-4.5 h-4.5 shrink-0" />
             <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>All Classrooms</span>
-          </button>
+          </motion.button>
 
-          <button
+          <motion.button
+            whileHover={animationsEnabled ? { x: 6 } : undefined}
+            whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
             onClick={() => { setFilter('single'); setSelectedGame(null); }}
             className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
               filter === 'single' && !selectedGame
@@ -2386,81 +4939,11 @@ if (iconUrl.includes('.ico')) {
           >
             <Gamepad2 className="w-4.5 h-4.5 shrink-0" />
             <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Single Player</span>
-          </button>
-
-          <button
-            onClick={() => { setFilter('multiplayer'); setSelectedGame(null); }}
-            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'multiplayer' && !selectedGame
-                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
-                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
-            }`}
-          >
-            <Users className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Multiplayer</span>
-          </button>
-
-          <button
-            onClick={() => { setFilter('Shooter'); setSelectedGame(null); }}
-            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'Shooter' && !selectedGame
-                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
-                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
-            }`}
-          >
-            <Globe className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Shooter</span>
-          </button>
-
-          <button
-            onClick={() => { setFilter('Party'); setSelectedGame(null); }}
-            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'Party' && !selectedGame
-                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
-                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
-            }`}
-          >
-            <Globe className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Party</span>
-          </button>
-
-          <button
-            onClick={() => { setFilter('Sports'); setSelectedGame(null); }}
-            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'Sports' && !selectedGame
-                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
-                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
-            }`}
-          >
-            <Globe className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Sports</span>
-          </button>
+          </motion.button>
           
-          <button
-            onClick={() => { setFilter('Random'); setSelectedGame(null); }}
-            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'Random' && !selectedGame
-                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
-                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
-            }`}
-          >
-            <Shuffle className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Random Games</span>
-          </button>
-
-          <button
-            onClick={() => { setFilter('Emulated'); setSelectedGame(null); }}
-            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'Emulated' && !selectedGame
-                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
-                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
-            }`}
-          >
-            <Cpu className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Emulated</span>
-          </button>
-
-          <button
+          <motion.button
+            whileHover={animationsEnabled ? { x: 6 } : undefined}
+            whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
             onClick={() => { setFilter('minecraft'); setSelectedGame(null); }}
             className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
               filter === 'minecraft' && !selectedGame
@@ -2470,327 +4953,1025 @@ if (iconUrl.includes('.ico')) {
           >
             <Box className="w-4.5 h-4.5 shrink-0" />
             <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Minecraft</span>
-          </button>
+          </motion.button>
+          
+          <div>
+            <motion.button
+              whileHover={animationsEnabled ? { x: 6 } : undefined}
+              whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+              onClick={() => {
+                setGameCatalogMode('all');
+                safeStorage.setItem('unblocked-game-catalog-mode', 'all');
+                if (!isEmulatedActive) {
+                  setFilter('Emulated');
+                  setSelectedGame(null);
+                  setEmulatedDropdownOpen(true);
+                } else {
+                  setEmulatedDropdownOpen(prev => !prev);
+                }
+              }}
+              className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center justify-between gap-2 text-sm font-medium transition-all duration-200 cursor-pointer ${
+                isEmulatedActive && !selectedGame
+                  ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
+                  : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
+              }`}
+            >
+              <div className="flex items-center gap-2.5 min-w-0">
+                <Cpu className="w-4.5 h-4.5 shrink-0" />
+                <div className={`flex items-center gap-1.5 min-w-0 transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>
+                  <span className="truncate">Emulated</span>
+                  {(emulatedTags.includes(filter) || filter === 'emulated-other') && (
+                    <span className="text-[10px] px-1.5 py-0.2 rounded font-mono uppercase bg-black/20 dark:bg-white/20 shrink-0">
+                      {filter === 'emulated-other' ? 'other' : filter}
+                    </span>
+                  )}
+                </div>
+              </div>
+              {sidebarOpen && (
+                <div
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEmulatedDropdownOpen(prev => !prev);
+                  }}
+                  className="p-1 rounded hover:bg-black/10 dark:hover:bg-white/10 transition-colors shrink-0"
+                  title={emulatedDropdownOpen ? "Collapse Emulated Systems" : "Expand Emulated Systems"}
+                >
+                  <ChevronDown className={`w-3.5 h-3.5 transition-transform duration-200 ${emulatedDropdownOpen ? 'rotate-180' : ''}`} />
+                </div>
+              )}
+            </motion.button>
 
-          <button
-            onClick={() => { setFilter('Not Games'); setSelectedGame(null); }}
+            {/* CUSTOM DROPDOWN - DROPS DOWN BENEATH EMULATED (ALL ITEMS VISIBLE, NO SCROLLBAR / NO SCROLL WHEEL) */}
+            <AnimatePresence>
+              {sidebarOpen && emulatedDropdownOpen && (
+                <motion.div
+                  initial={{ opacity: 0, height: 0, y: -4 }}
+                  animate={{ opacity: 1, height: 'auto', y: 0 }}
+                  exit={{ opacity: 0, height: 0, y: -4 }}
+                  transition={{ duration: 0.22, ease: 'easeOut' }}
+                  className="overflow-hidden mt-1 px-0.5"
+                >
+                  <div className="bg-[var(--bg-secondary)] border border-[var(--card-border)] rounded-xl p-1.5 shadow-lg flex flex-col gap-1">
+                    {/* All Emulated option */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGameCatalogMode('all');
+                        safeStorage.setItem('unblocked-game-catalog-mode', 'all');
+                        setFilter('Emulated');
+                        setSelectedGame(null);
+                      }}
+                      className={`w-full text-left px-2.5 py-1.5 rounded-lg text-xs font-semibold flex items-center justify-between transition-all cursor-pointer ${
+                        filter === 'Emulated' && !selectedGame
+                          ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-sm'
+                          : 'text-[var(--text-primary)] hover:bg-[var(--card-bg)] opacity-90 hover:opacity-100'
+                      }`}
+                    >
+                      <div className="flex items-center gap-1.5">
+                        {filter === 'Emulated' && !selectedGame && <Check className="w-3.5 h-3.5 shrink-0" />}
+                        <span>All Emulated</span>
+                      </div>
+                      <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded ${
+                        filter === 'Emulated' && !selectedGame
+                          ? 'bg-black/20 text-[var(--bg-color)]'
+                          : 'bg-[var(--card-bg)] text-[var(--text-muted)] border border-[var(--card-border)]'
+                      }`}>
+                        {totalEmulatedGamesCount}
+                      </span>
+                    </button>
+
+                    <div className="h-px bg-[var(--card-border)] my-0.5" />
+
+                    {/* Major systems (>= 10 games) and combined Other (< 10 games) - ALL VISIBLE, NO SCROLL WHEEL */}
+                    <div className="space-y-0.5">
+                      {emulatedMajorTags.map((tag) => {
+                        const isSelected = filter === tag && !selectedGame;
+                        const label = EMULATED_SYSTEM_NAMES[tag] || tag.toUpperCase();
+                        const count = emulatedTagCounts[tag] || 0;
+
+                        return (
+                          <button
+                            key={tag}
+                            type="button"
+                            onClick={() => {
+                              setGameCatalogMode('all');
+                              safeStorage.setItem('unblocked-game-catalog-mode', 'all');
+                              setFilter(tag);
+                              setSelectedGame(null);
+                            }}
+                            className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[11px] font-medium flex items-center justify-between transition-all cursor-pointer ${
+                              isSelected
+                                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] font-bold shadow-sm'
+                                : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)]'
+                            }`}
+                            title={`Filter by ${label}`}
+                          >
+                            <div className="flex items-center gap-1.5 truncate mr-1">
+                              {isSelected && <Check className="w-3 h-3 shrink-0" />}
+                              <span className="truncate">{label}</span>
+                            </div>
+                            <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded shrink-0 ${
+                              isSelected
+                                ? 'bg-black/20 text-[var(--bg-color)]'
+                                : 'bg-[var(--card-bg)] text-[var(--text-muted)] border border-[var(--card-border)]'
+                            }`}>
+                              {count}
+                            </span>
+                          </button>
+                        );
+                      })}
+
+                      {/* Combined Other entry (< 10 games) */}
+                      {emulatedOtherTags.length > 0 && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setGameCatalogMode('all');
+                            safeStorage.setItem('unblocked-game-catalog-mode', 'all');
+                            setFilter('emulated-other');
+                            setSelectedGame(null);
+                          }}
+                          className={`w-full text-left px-2.5 py-1.5 rounded-lg text-[11px] font-medium flex items-center justify-between transition-all cursor-pointer ${
+                            filter === 'emulated-other' && !selectedGame
+                              ? 'bg-[var(--accent-color)] text-[var(--bg-color)] font-bold shadow-sm'
+                              : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)]'
+                          }`}
+                          title="Other systems with less than 10 games (Lynx, Saturn, WonderSwan, ColecoVision, Neo Geo Pocket, etc.)"
+                        >
+                          <div className="flex items-center gap-1.5 truncate mr-1">
+                            {filter === 'emulated-other' && !selectedGame && <Check className="w-3 h-3 shrink-0" />}
+                            <span className="truncate font-semibold">Other</span>
+                          </div>
+                          <span className={`text-[9px] font-mono px-1.5 py-0.5 rounded shrink-0 ${
+                            filter === 'emulated-other' && !selectedGame
+                              ? 'bg-black/20 text-[var(--bg-color)]'
+                              : 'bg-[var(--card-bg)] text-[var(--text-muted)] border border-[var(--card-border)]'
+                          }`}>
+                            {totalOtherEmulatedGamesCount}
+                          </span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <motion.button
+            whileHover={animationsEnabled ? { x: 6 } : undefined}
+            whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+            onClick={() => { setFilter('featured'); setSelectedGame(null); }}
             className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
-              filter === 'Not Games' && !selectedGame
+              filter === 'featured' && !selectedGame
                 ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
                 : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
             }`}
           >
-            <Globe className="w-4.5 h-4.5 shrink-0" />
-            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Other Websites</span>
-          </button>
+            <Sparkles className="w-4.5 h-4.5 shrink-0" />
+            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Featured</span>
+          </motion.button>
+
+          <motion.button
+            whileHover={animationsEnabled ? { x: 6 } : undefined}
+            whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+            onClick={() => { setFilter('og'); setSelectedGame(null); }}
+            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
+              filter === 'og' && !selectedGame
+                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
+                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
+            }`}
+          >
+            <Crown className="w-4.5 h-4.5 shrink-0" />
+            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>OG Classics</span>
+          </motion.button>
+
+          <motion.button
+            whileHover={animationsEnabled ? { x: 6 } : undefined}
+            whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+            onClick={() => { setFilter('multiplayer'); setSelectedGame(null); }}
+            className={`w-full text-left py-2.5 px-3 rounded-lg flex items-center gap-3 text-sm font-medium transition-all duration-200 cursor-pointer ${
+              filter === 'multiplayer' && !selectedGame
+                ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-[0_4px_12px_var(--accent-shadow)] font-bold'
+                : 'hover:bg-[var(--card-bg)] text-[var(--text-primary)] opacity-80'
+            }`}
+          >
+            <Users className="w-4.5 h-4.5 shrink-0" />
+            <span className={`transition-all duration-300 ${sidebarOpen ? 'opacity-100 translate-x-0' : 'opacity-0 pointer-events-none md:hidden'}`}>Multiplayer</span>
+          </motion.button>
+
+          <div className="border-t border-[var(--card-border)] mt-2 pt-3 relative">
+            <div className="flex items-center gap-2 pb-2">
+              <Dices className="w-3.5 h-3.5 text-[var(--accent-color)] shrink-0" />
+              {sidebarOpen && (
+                <span className="text-[10px] font-mono uppercase tracking-wider text-[var(--text-muted)] whitespace-nowrap">
+                  Random Game Picker
+                </span>
+              )}
+            </div>
+
+            <button
+              type="button"
+              onClick={() => setRandomPickerOpen((prev) => !prev)}
+              className="w-full flex items-center justify-center gap-2 rounded-lg bg-[var(--accent-color)] px-2.5 py-1.5 text-[9px] font-black uppercase tracking-wider text-[var(--bg-color)] shadow-[0_6px_18px_var(--accent-shadow)] cursor-pointer"
+            >
+              <Dices className="w-3.5 h-3.5" />
+              Open Menu
+            </button>
+
+            <AnimatePresence>
+              {randomPickerOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: -8, scale: 0.98 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: -8, scale: 0.98 }}
+                  transition={{ duration: 0.18 }}
+                  className="absolute left-0 right-0 z-20 mt-2 rounded-2xl border border-[var(--card-border)] bg-[var(--bg-secondary)] p-3 shadow-2xl"
+                >
+                  <div className="flex items-center justify-between pb-2">
+                    <span className="text-[9px] font-mono uppercase tracking-[0.16em] text-[var(--text-muted)]">
+                      Pick Pool
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setRandomPickerOpen(false)}
+                      className="rounded-md p-1 text-[var(--text-muted)] hover:bg-[var(--card-bg)] hover:text-[var(--text-primary)] cursor-pointer"
+                      aria-label="Close random picker"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+
+                  <div className="flex flex-wrap gap-1.5 mb-3">
+                    {rankedGameSections.map((section) => (
+                      <button
+                        key={section.key}
+                        type="button"
+                        onClick={() => setRandomRankingPool(section.key)}
+                        className={`rounded-full border px-1.5 py-1 text-[8px] font-mono uppercase tracking-wider transition-all cursor-pointer ${
+                          randomRankingPool === section.key
+                            ? 'border-[var(--accent-color)] bg-[var(--accent-color)] text-[var(--bg-color)]'
+                            : 'border-[var(--card-border)] bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        {section.label}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="mb-3">
+                    <div className="mb-2 text-[9px] font-mono uppercase tracking-[0.14em] text-[var(--text-muted)]">
+                      Exclude tiers
+                    </div>
+                    <div className="flex flex-wrap gap-1.5">
+                      {gameTierOrder.map((tier) => {
+                        const excluded = excludedRandomTiers.includes(tier);
+                        return (
+                          <button
+                            key={tier}
+                            type="button"
+                            onClick={() => toggleExcludedTier(tier)}
+                            className={`rounded-full border px-2 py-1 text-[9px] font-black uppercase tracking-wide transition-all cursor-pointer ${
+                              excluded
+                                ? 'border-red-500/60 bg-red-500/10 text-red-200'
+                                : 'border-[var(--card-border)] bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                            }`}
+                          >
+                            {tier}
+                          </button>
+                        );
+                      })}
+                      <button
+                        type="button"
+                        onClick={() => toggleExcludedTier('EMULATED')}
+                        className={`rounded-full border px-2 py-1 text-[9px] font-black uppercase tracking-wide transition-all cursor-pointer ${
+                          excludedRandomTiers.includes('EMULATED')
+                            ? 'border-red-500/60 bg-red-500/10 text-red-200'
+                            : 'border-[var(--card-border)] bg-[var(--bg-primary)] text-[var(--text-muted)] hover:text-[var(--text-primary)]'
+                        }`}
+                      >
+                        Emulated
+                      </button>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={pickRandomRankedGame}
+                    className="w-full flex items-center justify-center gap-2 rounded-lg bg-[var(--accent-color)] px-2.5 py-1.5 text-[9px] font-black uppercase tracking-wider text-[var(--bg-color)] shadow-[0_6px_18px_var(--accent-shadow)] cursor-pointer"
+                  >
+                    <Dices className="w-3.5 h-3.5" />
+                    Pick Random
+                  </button>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </div>
+
+          <div className="flex-1" />
 
         </aside>
         )}
 
+
+
         {/* MAIN BODY DISPLAY */}
-        <main className="flex-1 min-w-0">
+        <main className="flex-1 min-w-0 flex flex-col h-full min-h-0">
           
           {!selectedGame ? (
-            filter === 'chat' ? (
-              <div className="flex flex-col w-full h-[calc(100vh-140px)] md:h-[calc(100vh-120px)] min-h-[550px] animate-fade-in bg-[var(--bg-secondary)]">
-                <ChatWorkspace onClose={() => setFilter('all')} />
-              </div>
-            ) : filter === 'movies' ? (
-              <div className="flex flex-col w-full h-[calc(100vh-140px)] md:h-[calc(100vh-120px)] min-h-[550px] animate-fade-in bg-[var(--bg-secondary)]">
-                <MoviesWorkspace onClose={() => setFilter('all')} />
-              </div>
-            ) : (
-              /* LIBRARY LIST VIEW */
-              <div className="flex flex-col gap-6">
+            <AnimatePresence mode="wait">
+              {filter === 'chat' ? (
+                <motion.div 
+                  key="chat"
+                  initial={animationsEnabled ? { opacity: 0, y: 15 } : false}
+                  animate={animationsEnabled ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+                  exit={animationsEnabled ? { opacity: 0, y: -15 } : undefined}
+                  transition={animationsEnabled ? { duration: 0.2 } : { duration: 0 }}
+                  className={`flex flex-col w-full min-h-[550px] bg-[var(--bg-secondary)] ${headerOpen ? 'h-[calc(100vh-140px)] md:h-[calc(100vh-120px)]' : 'h-[calc(100vh-100px)] md:h-[calc(100vh-80px)]'}`}
+                >
+                  <AiChatWorkspace onClose={() => setFilter('all')} />
+                </motion.div>
+              ) : filter === 'lobbychat' ? (
+                <motion.div 
+                  key="lobbychat"
+                  initial={animationsEnabled ? { opacity: 0, y: 15 } : false}
+                  animate={animationsEnabled ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+                  exit={animationsEnabled ? { opacity: 0, y: -15 } : undefined}
+                  transition={animationsEnabled ? { duration: 0.2 } : { duration: 0 }}
+                  className={`flex flex-col w-full min-h-[550px] bg-[var(--bg-secondary)] ${headerOpen ? 'h-[calc(100vh-140px)] md:h-[calc(100vh-120px)]' : 'h-[calc(100vh-100px)] md:h-[calc(100vh-80px)]'}`}
+                >
+                  <UserChat onClose={() => setFilter('all')} />
+                </motion.div>
+              ) : filter === 'info' ? (
+                <motion.div 
+                  key="info"
+                  initial={animationsEnabled ? { opacity: 0, y: 15 } : false}
+                  animate={animationsEnabled ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+                  exit={animationsEnabled ? { opacity: 0, y: -15 } : undefined}
+                  transition={animationsEnabled ? { duration: 0.2 } : { duration: 0 }}
+                  className={`flex flex-col w-full bg-[var(--bg-secondary)] overflow-hidden ${headerOpen ? 'h-[calc(100vh-90px)]' : 'h-[calc(100vh-45px)]'}`}
+                >
+                  <InformationSection 
+                    onClose={() => setFilter('all')} 
+                    games={games}
+                    onPlayGame={(game) => {
+                      setSelectedGame(game);
+                      setFilter('all');
+                    }}
+                    onGoToFeatured={() => {
+                      setFilter('featured');
+                      setSelectedGame(null);
+                    }}
+                    onDownloadWebsite={downloadEntireWebsite}
+                  />
+                </motion.div>
+              ) : filter === 'movies' ? (
+                <motion.div 
+                  key="movies"
+                  initial={animationsEnabled ? { opacity: 0, y: 15 } : false}
+                  animate={animationsEnabled ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+                  exit={animationsEnabled ? { opacity: 0, y: -15 } : undefined}
+                  transition={animationsEnabled ? { duration: 0.2 } : { duration: 0 }}
+                  className={`flex flex-col w-full min-h-[550px] bg-[var(--bg-secondary)] ${headerOpen ? 'h-[calc(100vh-140px)] md:h-[calc(100vh-120px)]' : 'h-[calc(100vh-100px)] md:h-[calc(100vh-80px)]'}`}
+                >
+                  <MoviesWorkspace onClose={() => setFilter('all')} />
+                </motion.div>
+              ) : filter === 'youtube' ? (
+                <motion.div 
+                  key="youtube"
+                  initial={animationsEnabled ? { opacity: 0, y: 15 } : false}
+                  animate={animationsEnabled ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+                  exit={animationsEnabled ? { opacity: 0, y: -15 } : undefined}
+                  transition={animationsEnabled ? { duration: 0.2 } : { duration: 0 }}
+                  className={`flex flex-col w-full min-h-[550px] bg-[#0c0a09] border border-[var(--card-border)]/60 rounded-2xl overflow-hidden ${headerOpen ? 'h-[calc(100vh-140px)] md:h-[calc(100vh-120px)]' : 'h-[calc(100vh-100px)] md:h-[calc(100vh-80px)]'}`}
+                >
+                  <iframe 
+                    src="https://urnperiodic.github.io/youtube1/" 
+                    className="w-full h-full border-none flex-1 shadow-inner bg-[#0c0a09]"
+                    allow="fullscreen"
+                    referrerPolicy="no-referrer"
+                  />
+                </motion.div>
+              ) : filter === 'download' ? (
+                <motion.div 
+                  key="download"
+                  initial={animationsEnabled ? { opacity: 0, y: 15 } : false}
+                  animate={animationsEnabled ? { opacity: 1, y: 0 } : { opacity: 1, y: 0 }}
+                  exit={animationsEnabled ? { opacity: 0, y: -15 } : undefined}
+                  transition={animationsEnabled ? { duration: 0.2 } : { duration: 0 }}
+                  className={`flex flex-col w-full min-h-[550px] bg-[#0c0a09] ${headerOpen ? 'h-[calc(100vh-140px)] md:h-[calc(100vh-120px)]' : 'h-[calc(100vh-100px)] md:h-[calc(100vh-80px)]'}`}
+                >
+                  <div className="flex items-center justify-between px-3 py-1.5 bg-[#121019] border-b border-white/10 text-xs shrink-0">
+                    <button
+                      onClick={() => setFilter('all')}
+                      className="flex items-center gap-1.5 px-3 py-1 rounded-md bg-white/10 hover:bg-[var(--accent-color)] text-white hover:text-black font-bold font-mono transition-all cursor-pointer"
+                    >
+                      <ArrowLeft className="w-3.5 h-3.5" />
+                      <span>Go back to portals</span>
+                    </button>
+                    <span className="font-mono text-[11px] text-neutral-400">Download Workspace</span>
+                  </div>
+                  <iframe 
+                    src="https://urnperiodic.github.io/download/" 
+                    className="w-full h-full border-none flex-1 shadow-inner bg-[#0c0a09]"
+                    allow="fullscreen; autoplay; clipboard-write; encrypted-media"
+                    referrerPolicy="no-referrer"
+                  />
+                </motion.div>
+              ) : (
+                <motion.div 
+                  key="games-list"
+                  initial={{ opacity: 0 }}
+                  animate={{ opacity: 1 }}
+                  exit={{ opacity: 0 }}
+                  transition={{ duration: 0.2 }}
+                  className="flex flex-col gap-6"
+                >
               
-              <div className="flex justify-between items-center border-l-4 border-[var(--accent-color)] pl-3">
-                <div>
-                  <h2 className="text-lg font-black uppercase tracking-wider text-[var(--text-primary)]">
-                    {filter === 'all' && 'Games Library'}
-                    {filter === 'favorites' && 'Bookmarked Games'}
-                    {filter === 'single' && 'Singleplayer Arcades'}
-                    {filter === 'multiplayer' && 'Multiplayer Hub'}
-                    {filter === 'Shooter' && 'Shooter Games'}
-                    {filter === 'Party' && 'Party Games'}
-                    {filter === 'Sports' && 'Sports Games'}
-                    {filter === 'Random' && 'Random Games'}
-                    {filter === 'Emulated' && 'Emulated Archives'}
-                    {filter === 'minecraft' && 'Minecraft Platform'}
-                    {filter === 'Not Games' && 'Not Games'}
-                  </h2>
-                  <p className="text-xs text-[var(--text-muted)] mt-0.5">
-                    Showing {filteredGames.length} unblocked resources
-                  </p>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                {/* Left group: Title & Subtitle + Combined Switcher & Pagination Bar */}
+                <div className="flex items-center gap-3 sm:gap-4 flex-wrap">
+                  {/* Title & Subtitle with left accent bar */}
+                  <div className="border-l-[3px] border-[var(--accent-color)] pl-2.5 shrink-0 transition-colors">
+                    <h2 className="text-sm sm:text-base font-black uppercase tracking-wider text-[var(--text-primary)] leading-tight">
+                      {normalizedSearchQuery !== '' ? (
+                        `SEARCH: "${searchQuery}"`
+                      ) : (
+                        <>
+                          {filter === 'all' && (gameCatalogMode === 'original' ? 'ORIGINALS' : 'ALL PORTALS')}
+                          {filter === 'favorites' && 'BOOKMARKS'}
+                          {filter === 'featured' && 'FEATURED SHOWCASES'}
+                          {filter === 'og' && 'OG CLASSICS & ORIGINALS'}
+                          {filter === 'single' && 'SINGLEPLAYER PORTALS'}
+                          {filter === 'multiplayer' && 'MULTIPLAYER PORTALS'}
+                          {filter === 'Emulated' && 'EMULATED ARCHIVES'}
+                          {filter === 'emulated-other' && 'EMULATED: OTHER SYSTEMS (<10 GAMES)'}
+                          {emulatedTags.includes(filter) && `EMULATED: ${(EMULATED_SYSTEM_NAMES[filter] || filter).toUpperCase()}`}
+                          {filter === 'minecraft' && 'MINECRAFT PLATFORM'}
+                        </>
+                      )}
+                    </h2>
+                    <p className="text-[11px] text-[var(--text-muted)] mt-0.5 font-medium">
+                      {normalizedSearchQuery !== ''
+                        ? `Found ${filteredGames.length} portals · Page ${safeGamePage} of ${totalGamePages}`
+                        : `Showing ${filteredGames.length} unblocked resources · Page ${safeGamePage} of ${totalGamePages}`}
+                    </p>
+                  </div>
+
+                  {/* Combined Switcher & Pagination Capsule */}
+                  <div className="flex items-center bg-[var(--bg-secondary)] border border-[var(--card-border)] p-0.5 rounded-xl shadow-sm select-none shrink-0 flex-wrap sm:flex-nowrap gap-0.5 transition-colors">
+                    {/* Catalog Mode Switcher */}
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGameCatalogMode('original');
+                        safeStorage.setItem('unblocked-game-catalog-mode', 'original');
+                        setCurrentGamePage(1);
+                      }}
+                      className={`text-[10px] font-mono font-black uppercase px-2.5 py-1 rounded-lg transition-all cursor-pointer tracking-wider ${
+                        gameCatalogMode === 'original'
+                          ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-sm'
+                          : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)]'
+                      }`}
+                    >
+                      ORIGINALS
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setGameCatalogMode('all');
+                        safeStorage.setItem('unblocked-game-catalog-mode', 'all');
+                        setCurrentGamePage(1);
+                      }}
+                      className={`text-[10px] font-mono font-black uppercase px-2.5 py-1 rounded-lg transition-all cursor-pointer tracking-wider ${
+                        gameCatalogMode === 'all'
+                          ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-sm'
+                          : 'text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)]'
+                      }`}
+                    >
+                      ALL PORTALS (2708)
+                    </button>
+
+                    {/* Subtle divider */}
+                    <div className="h-4 w-[1px] bg-[var(--card-border)] mx-1 hidden sm:block" />
+
+                    {/* Prev / Page / Next Integrated Controls */}
+                    <div className="flex items-center gap-1 font-mono pl-0.5">
+                      <button
+                        type="button"
+                        onClick={() => setCurrentGamePage((page) => Math.max(1, page - 1))}
+                        disabled={safeGamePage === 1}
+                        className={`flex items-center gap-0.5 text-[10px] font-mono font-bold px-2 py-1 rounded-lg transition-all cursor-pointer ${
+                          safeGamePage > 1
+                            ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-sm hover:opacity-90'
+                            : 'text-[var(--text-muted)] opacity-30 pointer-events-none'
+                        }`}
+                        title="Previous Page"
+                      >
+                        <ChevronLeft className="w-3 h-3" />
+                        <span>Prev</span>
+                      </button>
+
+                      <span className="text-[10px] font-mono font-bold text-[var(--text-primary)] px-1.5 select-none tracking-wider whitespace-nowrap">
+                        {safeGamePage} / {totalGamePages}
+                      </span>
+
+                      <button
+                        type="button"
+                        onClick={() => setCurrentGamePage((page) => Math.min(totalGamePages, page + 1))}
+                        disabled={safeGamePage === totalGamePages}
+                        className={`flex items-center gap-0.5 text-[10px] font-mono font-bold px-2 py-1 rounded-lg transition-all cursor-pointer ${
+                          safeGamePage < totalGamePages
+                            ? 'bg-[var(--accent-color)] text-[var(--bg-color)] shadow-sm hover:opacity-90'
+                            : 'text-[var(--text-muted)] opacity-30 pointer-events-none'
+                        }`}
+                        title="Next Page"
+                      >
+                        <span>Next</span>
+                        <ChevronRight className="w-3 h-3" />
+                      </button>
+                    </div>
+                  </div>
                 </div>
               </div>
 
               {filteredGames.length === 0 ? (
                 <div className="flex flex-col items-center justify-center py-20 border border-dashed border-[var(--card-border)] rounded-2xl bg-[var(--bg-secondary)]">
                   <Gamepad2 className="w-16 h-16 text-[var(--text-muted)] stroke-1 opacity-40 animate-pulse" />
-                  <p className="text-sm font-semibold mt-4 text-[var(--text-primary)]">No games found matches filter</p>
+                  <p className="text-sm font-semibold mt-4 text-[var(--text-primary)]">No portals found matching filter</p>
                   <p className="text-xs text-[var(--text-muted)] mt-1">Try searching a different keyword or resetting filters.</p>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-3 gap-6">
-                  {filteredGames.map(game => {
+                  {paginatedGames.map((game, index) => {
                     const isFav = favorites.includes(game.id);
                     return (
-                      <div 
+                      <motion.div 
                         key={game.id}
+                        initial={animationsEnabled ? { opacity: 0 } : false}
+                        animate={{ opacity: 1 }}
+                        exit={animationsEnabled ? { opacity: 0 } : undefined}
+                        transition={animationsEnabled ? { duration: 0.15 } : { duration: 0 }}
+                        whileHover={animationsEnabled ? { scale: 1.03, y: -4, transition: { duration: 0.2 } } : undefined}
+                        whileTap={animationsEnabled ? { scale: 0.98 } : undefined}
                         onClick={() => { setSelectedGame(game); setZoom(1); }}
-                        className="custom-card flex flex-col rounded-xl overflow-hidden cursor-pointer h-[360px]"
-                        style={{ contentVisibility: 'auto' }}
+                        className={`custom-card flex flex-col rounded-xl overflow-hidden cursor-pointer h-full ${
+                          animationsEnabled ? 'transition-all duration-300' : ''
+                        } ${
+                          game.featured 
+                            ? 'border-amber-500/20 hover:border-amber-500/50 shadow-md hover:shadow-amber-500/5' 
+                            : ''
+                        }`}
                       >
                         {/* Artwork container */}
-                        <div className="relative h-48 bg-neutral-950 flex-shrink-0 flex items-center justify-center border-b border-[var(--card-border)] overflow-hidden">
+                        <div className="relative aspect-video w-full bg-neutral-950 flex-shrink-0 flex items-center justify-center border-b border-[var(--card-border)] overflow-hidden">
                           {game.thumbnail && !failedThumbnails[game.id] ? (
                             <img 
-                              src={game.thumbnail} 
+                              src={getOptimizedThumbnail(game.thumbnail)} 
                               alt={game.title} 
+                              width="640"
+                              height="360"
+                              loading="lazy"
+                              decoding="async"
                               referrerPolicy="no-referrer"
+                              draggable="false"
                               onError={() => setFailedThumbnails(prev => ({ ...prev, [game.id]: true }))}
-                              className="w-full h-full object-cover transition-transform duration-500 hover:scale-110" 
+                              className="w-full h-full object-cover transition-transform duration-500 hover:scale-110 select-none pointer-events-none" 
                             />
                           ) : (
-                            renderGameArt(game)
+                            <img
+                              src={defaultThumbnail}
+                              alt={game.title}
+                              width="640"
+                              height="360"
+                              loading="lazy"
+                              decoding="async"
+                              draggable="false"
+                              className="w-full h-full object-cover select-none pointer-events-none"
+                            />
+                          )}
+
+                          {game.featured && (
+                            <span className="absolute top-2.5 left-2.5 text-[12px] font-black bg-black/85 text-amber-400 border border-amber-500/30 w-6 h-6 rounded-md inline-flex items-center justify-center z-10 shadow-sm font-mono">
+                              ★
+                            </span>
                           )}
 
                           <span className="absolute top-2.5 right-2.5 text-[8px] font-bold uppercase tracking-widest bg-black/75 backdrop-blur-sm text-white border border-white/10 px-2.5 py-0.5 rounded-full inline-block z-10">
                             {game.category}
                           </span>
 
-                          <button
-                            onClick={(e) => toggleFavorite(e, game.id)}
-                            className="absolute top-2.5 left-2.5 p-1.5 rounded-full bg-black/40 hover:bg-black/80 text-white/90 border border-white/10 hover:text-rose-500 hover:scale-110 active:scale-95 transition-all duration-200"
-                            title={isFav ? "Remove Bookmark" : "Add Bookmark"}
-                          >
-                            <Heart className={`w-3.5 h-3.5 ${isFav ? 'fill-rose-500 text-rose-500' : ''}`} />
-                          </button>
+                          {game.isAiGenerated && (
+                            <span className="absolute bottom-2.5 left-2.5 flex items-center gap-1 text-[8px] font-extrabold tracking-wider bg-black/85 backdrop-blur-sm text-white border border-white/20 px-2 py-0.5 rounded-full inline-flex z-10 shadow-sm font-mono uppercase">
+                              <svg viewBox="0 0 24 24" className="w-2.5 h-2.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                <path d="M12 0C12 6.627 6.627 12 0 12C6.627 12 12 17.373 12 24C12 17.373 17.373 12 24 12C17.373 12 12 6.627 12 0Z" fill="currentColor" />
+                              </svg>
+                              <span>Gemini</span>
+                            </span>
+                          )}
+
                         </div>
 
                         {/* Title and descriptions */}
-                        <div className="p-4 flex-1 flex flex-col justify-between">
+                        <div className="games-card-copy p-4 flex-1 flex flex-col justify-between">
                           <div className="space-y-1.5">
-                            <h3 className="text-sm font-black text-[var(--text-primary)] line-clamp-1 group-hover:text-[var(--accent-color)] leading-snug">
-                              {game.title}
+                            <h3 className={`games-card-copy-title text-sm font-black line-clamp-1 leading-snug transition-colors flex items-center gap-1.5 ${
+                              game.featured 
+                                ? 'text-[var(--text-primary)] group-hover:text-amber-400' 
+                                : 'text-[var(--text-primary)] group-hover:text-[var(--accent-color)]'
+                            }`}>
+                              <span className="min-w-0 flex-1 truncate">{game.title}</span>
+                              {game.isAiGenerated && (
+                                <span className="inline-flex items-center px-1.5 py-0.5 rounded bg-[var(--accent-color)]/10 border border-[var(--card-border)] text-[var(--text-primary)]" title="Gemini AI Generated">
+                                  <svg viewBox="0 0 24 24" className="w-2.5 h-2.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                                    <path d="M12 0C12 6.627 6.627 12 0 12C6.627 12 12 17.373 12 24C12 17.373 17.373 12 24 12C17.373 12 12 6.627 12 0Z" fill="currentColor" />
+                                  </svg>
+                                </span>
+                              )}
+                              <div className="ml-auto flex items-center gap-1.5 shrink-0">
+                                <span className="text-[9px] font-mono text-[var(--text-muted)] font-medium select-none tracking-tight">
+                                  (Dev tools)
+                                </span>
+                                <button
+                                  type="button"
+                                  aria-label={`Copy piece path for ${game.title} (Dev tools)`}
+                                  title={`Copy piece path for ${game.title} (Dev tools)`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    copyTextToClipboard(getGamePathName(game.url));
+                                  }}
+                                  className="p-1 rounded border border-[var(--card-border)] bg-[var(--bg-secondary)] text-[var(--text-muted)] hover:border-[var(--accent-color)] hover:text-[var(--accent-color)] transition-colors"
+                                >
+                                  <Copy className="w-3 h-3" />
+                                </button>
+                                <button
+                                  type="button"
+                                  aria-label={`Copy piece title for ${game.title} (Dev tools)`}
+                                  title={`Copy piece title for ${game.title} (Dev tools)`}
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    copyTextToClipboard(game.title);
+                                  }}
+                                  className="p-1 rounded border border-[var(--card-border)] bg-[var(--bg-secondary)] text-[var(--text-muted)] hover:border-[var(--accent-color)] hover:text-[var(--accent-color)] transition-colors"
+                                >
+                                  <Copy className="w-3 h-3" />
+                                </button>
+                              </div>
                             </h3>
                             <p className="text-xs text-[var(--text-muted)] line-clamp-3 leading-relaxed">
                               {game.description}
                             </p>
                           </div>
 
-                          <button
-                            onClick={() => { setSelectedGame(game); setZoom(1); }}
-                            className="w-full mt-3 border border-[var(--accent-color)] hover:bg-[var(--accent-color)] hover:text-black hover:font-bold hover:shadow-[0_0_12px_calc(var(--accent-color))] text-[11px] font-semibold tracking-wider text-[var(--accent-color)] py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition-all duration-200 self-end"
-                          >
-                            <Play className="w-3 h-3 fill-current" />
-                            <span>Open Article</span>
-                          </button>
+                          <div className="flex items-center gap-2 mt-3 w-full">
+                            {game.featured ? (
+                              <button
+                                onClick={() => { setSelectedGame(game); setZoom(1); }}
+                                className="flex-1 border border-amber-500/40 bg-amber-500/10 hover:bg-amber-500 hover:text-black hover:font-bold hover:shadow-[0_4px_14px_rgba(245,158,11,0.35)] text-[11px] font-semibold tracking-wider text-amber-500 dark:text-amber-400 py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition-all duration-200 uppercase cursor-pointer"
+                              >
+                                <Play className="w-3 h-3 fill-current" />
+                                <span>Play</span>
+                              </button>
+                            ) : (
+                              <button
+                                onClick={() => { setSelectedGame(game); setZoom(1); }}
+                                className="flex-1 border border-[var(--card-border)] bg-[var(--accent-color)]/5 hover:bg-[var(--accent-color)] hover:text-[var(--bg-color)] hover:font-bold hover:shadow-[0_4px_14px_var(--accent-shadow)] text-[11px] font-semibold tracking-wider text-[var(--text-primary)] py-2 px-3 rounded-lg flex items-center justify-center gap-1.5 transition-all duration-200 uppercase cursor-pointer"
+                              >
+                                <Play className="w-3 h-3 fill-current" />
+                                <span>Play</span>
+                              </button>
+                            )}
+
+                            <button
+                              type="button"
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                openGameInAboutBlank(game);
+                              }}
+                              className="p-2 border border-[var(--card-border)] hover:border-[var(--accent-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] bg-[var(--bg-secondary)] hover:bg-[var(--card-bg)] rounded-lg transition-all flex items-center justify-center shrink-0 cursor-pointer"
+                              title="Open Portal in about:blank"
+                              aria-label={`Open ${game.title} in about:blank`}
+                            >
+                              <ExternalLink className="w-4 h-4" />
+                            </button>
+
+                            {isLocalGame(game.url) && (
+                              <>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    window.open(getDirectGmfilesUrl(game.url), '_blank');
+                                  }}
+                                  className="p-2 border border-[var(--card-border)] hover:border-[var(--accent-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] bg-[var(--bg-secondary)] hover:bg-[var(--card-bg)] rounded-lg transition-all flex items-center justify-center shrink-0 cursor-pointer"
+                                  title={`Open Direct Link (${getDirectGmfilesUrl(game.url)})`}
+                                >
+                                  <svg viewBox="0 0 24 24" className="w-4 h-4" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                                    <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                                    <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                                  </svg>
+                                </button>
+
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    const link = document.createElement('a');
+                                    link.href = getLocalGameDownloadUrl(game.url);
+                                    link.download = game.url.split('/').pop() || game.url;
+                                    document.body.appendChild(link);
+                                    link.click();
+                                    document.body.removeChild(link);
+                                  }}
+                                  className="p-2 border border-[var(--card-border)] hover:border-[var(--accent-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] bg-[var(--bg-secondary)] hover:bg-[var(--card-bg)] rounded-lg transition-all flex items-center justify-center shrink-0 cursor-pointer"
+                                  title="Download Offline Piece (.html)"
+                                >
+                                  <Download className="w-4 h-4" />
+                                </button>
+                              </>
+                            )}
+                          </div>
                         </div>
-                      </div>
+                      </motion.div>
                     );
                   })}
                 </div>
               )}
 
-            </div>
-          )
-        ) : selectedGame.title === 'Bloons TD 5 Sandbox' ? (
-          <div className="flex flex-col gap-4 animate-fade-in bg-[#0c0f16]/90 p-4 md:p-6 rounded-2xl border border-zinc-800 shadow-2xl">
-            <div className="flex justify-start">
-              <button
-                onClick={() => setSelectedGame(null)}
-                className="flex items-center gap-2 border border-[var(--card-border)] hover:border-[var(--accent-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] transition-all font-mono py-1.5 px-3.5 rounded-lg text-xs font-bold bg-[var(--bg-secondary)] leading-normal cursor-pointer"
-              >
-                <ArrowLeft className="w-3.5 h-3.5" />
-                <span>Go back to game grid</span>
-              </button>
-            </div>
-            <BloonsSandbox onClose={() => setSelectedGame(null)} />
-          </div>
-        ) : (
+              {filteredGames.length > GAMES_PER_PAGE && (
+                <div className="flex items-center justify-center gap-4 pt-6 border-t border-[var(--card-border)]/50">
+                  <button
+                    type="button"
+                    onClick={() => setCurrentGamePage((page) => Math.max(1, page - 1))}
+                    disabled={safeGamePage === 1}
+                    className="flex items-center gap-1.5 rounded-lg border border-[var(--card-border)] bg-[var(--bg-secondary)] px-4 py-2 text-xs font-bold text-[var(--text-primary)] transition-colors hover:border-[var(--accent-color)] hover:text-[var(--accent-color)] disabled:cursor-not-allowed disabled:opacity-40 shadow-sm"
+                  >
+                    <ChevronLeft className="h-3.5 w-3.5" />
+                    Go Back
+                  </button>
+                  <span className="min-w-28 text-center font-mono text-xs text-[var(--text-muted)] font-bold">
+                    Page {safeGamePage} of {totalGamePages}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setCurrentGamePage((page) => Math.min(totalGamePages, page + 1))}
+                    disabled={safeGamePage === totalGamePages}
+                    className="flex items-center gap-1.5 rounded-lg bg-[var(--accent-color)] px-4 py-2 text-xs font-extrabold text-[var(--bg-color)] transition-colors hover:brightness-110 disabled:cursor-not-allowed disabled:opacity-40 shadow-sm"
+                  >
+                    Next Page
+                    <ChevronRight className="h-3.5 w-3.5" />
+                  </button>
+                </div>
+              )}
+
+            </motion.div>
+          )}
+        </AnimatePresence>
+          ) : (
             /* ACTIVE GAME SCREEN */
-            <div className="flex flex-col gap-4 animate-fade-in">
+            <div className={`flex flex-col flex-1 h-full min-h-0 animate-fade-in ${windowFullscreen ? 'fixed inset-0 z-[9999] bg-[#0c0f16] p-0 w-screen h-screen overflow-hidden gap-0' : 'gap-0 flex-1 h-full min-h-0'}`}>
               
               {/* Controls bar */}
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between border border-[var(--card-border)] bg-[var(--bg-secondary)] rounded-xl py-3 px-4 gap-3 shadow-inner">
-                
-                <button
-                  onClick={() => setSelectedGame(null)}
-                  className="flex items-center gap-2 border border-[var(--card-border)] hover:border-[var(--accent-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] transition-all font-mono py-1.5 px-3.5 rounded-lg text-xs font-bold leading-normal cursor-pointer"
-                >
-                  <ArrowLeft className="w-3.5 h-3.5" />
-                  <span>Go back</span>
-                </button>
-
-                <div className="flex items-center gap-2.5">
-                  <span className="font-bold text-sm text-[var(--text-primary)] flex items-center gap-2">
-                    {selectedGame.title}
-                    <span className="text-[9px] uppercase tracking-wider font-mono px-2 py-0.5 rounded border border-[var(--card-border)] bg-[var(--bg-color)] text-[var(--accent-color)]">
-                      {selectedGame.category}
-                    </span>
-                  </span>
+              {windowFullscreen ? (
+                <div className="absolute top-4 right-4 z-[10000]">
+                  <button
+                    onClick={() => setWindowFullscreen(false)}
+                    className="flex items-center justify-center w-8 h-8 bg-black/40 hover:bg-black/65 border border-white/10 hover:border-white/25 text-white/85 hover:text-white transition-all rounded-lg backdrop-blur-md cursor-pointer shadow-[0_4px_12px_rgba(0,0,0,0.4)] active:scale-95 animate-fade-in"
+                    title="Exit Window Fullscreen"
+                  >
+                    <Minimize2 className="w-4 h-4" />
+                  </button>
                 </div>
-
-                <div className="flex items-center gap-2 flex-wrap">
+              ) : (
+                <div className={`sticky ${gameHeaderHidden ? 'top-0' : headerOpen ? 'top-[108px] sm:top-[56px]' : 'top-[108px] md:top-[44px]'} z-[50] flex flex-col sm:flex-row sm:items-center justify-between border-b border-[var(--card-border)] bg-[var(--bg-secondary)] rounded-none py-3 px-4 gap-3 shadow-inner`}>
                   
-                  {/* Zoom controls */}
-                  <div className="flex items-center bg-[var(--bg-color)] border border-[var(--card-border)] rounded-lg overflow-hidden p-0.5">
-                    <button
-                      onClick={() => setZoom(z => Math.max(0.4, z - 0.1))}
-                      className="p-1 px-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)] rounded transition-colors"
-                      title="Zoom Out"
-                    >
-                      <Minus className="w-3.5 h-3.5" />
-                    </button>
-                    <span className="text-[10px] px-2 font-mono text-[var(--text-primary)] font-bold select-none">
-                      {Math.round(zoom * 100)}%
+                  <button
+                    onClick={() => {
+                      safeStorage.removeItem('unblocked-last-game');
+                      setSelectedGame(null);
+                    }}
+                    className="flex items-center gap-2 border border-[var(--card-border)] hover:border-[var(--accent-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] transition-all font-mono py-1.5 px-3.5 rounded-lg text-xs font-bold leading-normal cursor-pointer"
+                  >
+                    <ArrowLeft className="w-3.5 h-3.5" />
+                    <span>Go back</span>
+                  </button>
+
+                  <div className="hidden xl:flex items-center gap-2.5">
+                    <span className="font-bold text-sm text-[var(--text-primary)] flex items-center gap-2">
+                      {selectedGame.title}
+                      <span className="text-[9px] uppercase tracking-wider font-mono px-2 py-0.5 rounded border border-[var(--card-border)] bg-[var(--bg-color)] text-[var(--accent-color)]">
+                        {selectedGame.category}
+                      </span>
+                      {selectedGame.isAiGenerated && (
+                        <span className="inline-flex items-center gap-1 text-[9px] uppercase tracking-wider font-mono px-2 py-0.5 rounded border border-[var(--card-border)] bg-[var(--accent-color)]/10 text-[var(--text-primary)]">
+                          <svg viewBox="0 0 24 24" className="w-2.5 h-2.5 shrink-0" fill="none" xmlns="http://www.w3.org/2000/svg">
+                            <path d="M12 0C12 6.627 6.627 12 0 12C6.627 12 12 17.373 12 24C12 17.373 17.373 12 24 12C17.373 12 12 6.627 12 0Z" fill="currentColor" />
+                          </svg>
+                          <span>Gemini AI</span>
+                        </span>
+                      )}
                     </span>
-                    <button
-                      onClick={() => setZoom(z => Math.min(1.8, z + 0.1))}
-                      className="p-1 px-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)] rounded transition-colors"
-                      title="Zoom In"
-                    >
-                      <Plus className="w-3.5 h-3.5" />
-                    </button>
-                    <button
-                      onClick={() => setZoom(1)}
-                      className="p-1 px-1.5 text-xs text-[var(--accent-color)] font-mono hover:bg-[var(--card-bg)] rounded transition-colors"
-                      title="Reset Zoom"
-                    >
-                      Res
-                    </button>
                   </div>
 
-                  {/* Reload button */}
-                  <button
-                    onClick={() => {
-                      const iframe = document.getElementById('game-frame');
-                      if (iframe) iframe.src = iframe.src;
-                    }}
-                    className="p-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] rounded-lg text-[var(--text-primary)] transition-all cursor-pointer"
-                    title="Reload game frame session"
-                  >
-                    <RotateCcw className="w-3.5 h-3.5" />
-                  </button>
+                  <div className="flex items-center gap-2 flex-wrap">
+                    
+                    {/* Zoom controls */}
+                    <div className="flex items-center bg-[var(--bg-color)] border border-[var(--card-border)] rounded-lg overflow-hidden p-0.5">
+                      <button
+                        onClick={() => setZoom(z => Math.max(0.4, z - 0.1))}
+                        className="p-1 px-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)] rounded transition-colors"
+                        title="Zoom Out"
+                      >
+                        <Minus className="w-3.5 h-3.5" />
+                      </button>
+                      <span className="text-[10px] px-2 font-mono text-[var(--text-primary)] font-bold select-none">
+                        {Math.round(zoom * 100)}%
+                      </span>
+                      <button
+                        onClick={() => setZoom(z => Math.min(1.8, z + 0.1))}
+                        className="p-1 px-1.5 text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--card-bg)] rounded transition-colors"
+                        title="Zoom In"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                      </button>
+                      <button
+                        onClick={() => setZoom(1)}
+                        className="p-1 px-1.5 text-xs text-[var(--accent-color)] font-mono hover:bg-[var(--card-bg)] rounded transition-colors"
+                        title="Reset Zoom"
+                      >
+                        Reset
+                      </button>
+                    </div>
 
-                  {/* Fullscreen button */}
-                  <button
-                    onClick={() => {
-                      const container = document.getElementById('frame-viewport');
-                      if (container) {
-                        if (document.fullscreenElement) {
-                          document.exitFullscreen();
-                        } else {
-                          container.requestFullscreen();
+                    {/* Reload button */}
+                    <button
+                      onClick={() => {
+                        const iframe = document.getElementById('game-frame');
+                        if (iframe) iframe.src = iframe.src;
+                      }}
+                      className="p-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] rounded-lg text-[var(--text-primary)] transition-all cursor-pointer"
+                      title="Reload portal frame session"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* Direct Gmfiles Link button for local public games */}
+                    {selectedGame && isLocalGame(selectedGame.url) && (
+                      <button
+                        onClick={() => {
+                          window.open(getDirectGmfilesUrl(selectedGame.url), '_blank');
+                        }}
+                        className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] py-1.5 px-2.5 rounded-lg text-xs font-mono text-[var(--text-primary)] font-medium transition-all cursor-pointer"
+                        title={`Open Direct Link (${getDirectGmfilesUrl(selectedGame.url)})`}
+                      >
+                        <svg viewBox="0 0 24 24" className="w-3.5 h-3.5" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                          <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"></path>
+                          <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"></path>
+                        </svg>
+                      </button>
+                    )}
+
+                    {/* Download button for local public games */}
+                    {selectedGame && isLocalGame(selectedGame.url) && (
+                      <button
+                        onClick={() => {
+                          const link = document.createElement('a');
+                          link.href = getLocalGameDownloadUrl(selectedGame.url);
+                          link.download = selectedGame.url.split('/').pop() || selectedGame.url;
+                          document.body.appendChild(link);
+                          link.click();
+                          document.body.removeChild(link);
+                        }}
+                        className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] py-1.5 px-3 rounded-lg text-xs font-mono text-[var(--text-primary)] font-medium transition-all cursor-pointer"
+                        title="Download Offline Piece (.html)"
+                      >
+                        <Download className="w-3.5 h-3.5 text-[var(--accent-color)]" />
+                        <span className="hidden sm:inline text-[10px] font-bold text-[var(--accent-color)]">DOWNLOAD PIECE</span>
+                      </button>
+                    )}
+
+                    {/* Fullscreen button */}
+                    <button
+                      onClick={() => {
+                        const container = document.getElementById('frame-viewport');
+                        if (container) {
+                          if (document.fullscreenElement) {
+                            document.exitFullscreen();
+                          } else {
+                            container.requestFullscreen();
+                          }
                         }
-                      }
-                    }}
-                    className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] py-1.5 px-3 rounded-lg text-xs font-mono text-[var(--text-primary)] font-medium transition-all cursor-pointer"
-                    title="Toggle Fullscreen Arena"
-                  >
-                    <Maximize2 className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline text-[10px] font-bold">FULLSCREEN</span>
-                  </button>
+                      }}
+                      className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] py-1.5 px-2.5 rounded-lg text-xs font-mono text-[var(--text-primary)] font-medium transition-all cursor-pointer"
+                      title="Toggle Fullscreen Arena"
+                    >
+                      <Expand className="w-3.5 h-3.5" />
+                    </button>
+
+                    {/* Window Fullscreen Button */}
+                    <button
+                      onClick={() => setWindowFullscreen(!windowFullscreen)}
+                      className={`flex items-center gap-1.5 border py-1.5 px-2.5 rounded-lg text-xs font-mono font-medium transition-all cursor-pointer ${
+                        windowFullscreen
+                          ? 'border-amber-500 bg-amber-500/15 text-amber-500 font-bold shadow-[0_0_8px_rgba(245,158,11,0.2)]'
+                          : 'border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)]'
+                      }`}
+                      title={windowFullscreen ? "Exit Window Fullscreen" : "Window Fullscreen Mode"}
+                    >
+                      {windowFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
+                    </button>
 
                   {/* Open in New Tab button */}
                   <button
-                    onClick={() => {
-                      const win = window.open("about:blank", "_blank");
-                      if (!win) {
-                        alert("Popup blocked. Allow popups for this site.");
-                        return;
-                      }
-
-                      const bookSvgDataUri = `data:image/svg+xml;utf8,${encodeURIComponent(
-                        `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="%23f97316" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1-2.5-2.5Z"/><path d="M6 6h15M6 10h15"/></svg>`
-                      )}`;
-                      let tabTitle = selectedGame.title;
-                      let tabFavicon = bookSvgDataUri;
-                      if (decoyType === 'classroom') {
-                        tabTitle = "Home - Classroom";
-                        tabFavicon = "https://ssl.gstatic.com/classroom/favicon.png";
-                      } else if (decoyType === 'clever') {
-                        tabTitle = "Clever | Log in with Clever";
-                        tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=clever.com";
-                      } else if (decoyType === 'campus') {
-                        tabTitle = "Campus Student";
-                        tabFavicon = "https://jerseycitynj.infinitecampus.org/campus/favicon-32x32.png";
-                      } else if (decoyType === 'docs') {
-                        tabTitle = "Google Docs";
-                        tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=docs.google.com";
-                      } else if (decoyType === 'gmail') {
-                        tabTitle = "Inbox - Jersey City Public Schools";
-                        tabFavicon = "https://www.google.com/s2/favicons?sz=64&domain=mail.google.com";
-                      }
-
-                      win.document.write(`
-                        <!DOCTYPE html>
-                        <html>
-                        <head>
-                          <title>${tabTitle}</title>
-                          <link rel="icon" href="${tabFavicon}">
-                          <link rel="shortcut icon" href="${tabFavicon}">
-                          <meta charset="utf-8">
-                          <style>
-                            html, body { margin: 0; padding: 0; width: 100%; height: 100%; overflow: hidden; background: #ffffff; }
-                            iframe { width: 100vw; height: 100vh; border: none; display: block; }
-                          </style>
-                        </head>
-                        <body>
-                          <iframe src="${selectedGame.url}" allow="fullscreen" referrerpolicy="no-referrer"></iframe>
-                        </body>
-                        </html>
-                      `);
-                      win.document.close();
-                    }}
-                    className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] py-1.5 px-3 rounded-lg text-xs font-mono text-[var(--text-primary)] font-medium transition-all cursor-pointer"
-                    title="Open Game in New Tab"
+                    onClick={() => openGameInAboutBlank(selectedGame)}
+                    className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] py-1.5 px-2.5 rounded-lg text-xs font-mono text-[var(--text-primary)] font-medium transition-all cursor-pointer"
+                    title="Open Portal in New Tab (about:blank)"
                   >
                     <ExternalLink className="w-3.5 h-3.5" />
-                    <span className="hidden sm:inline text-[10px] font-bold">OPEN IN NEW TAB</span>
                   </button>
 
-                  {/* Panic Key / Escape to Academic Articles */}
+                  {/* Lobby Chat Toggle Button */}
                   <button
-                    onClick={() => {
-                      setViewModeAndSave('articles');
-                      setSelectedGame(null);
-                    }}
-                    className="flex items-center gap-1.5 border border-red-500/30 hover:border-red-500 hover:bg-red-500/10 py-1.5 px-3 rounded-lg text-xs font-mono text-red-500 font-medium transition-all cursor-pointer whitespace-nowrap"
-                    title="Panic escape key (or press [ or ] at any time)"
+                    onClick={() => setDockedChatCollapsed(!dockedChatCollapsed)}
+                    className={`flex items-center gap-1.5 border py-1.5 px-2.5 rounded-lg text-xs font-mono font-medium transition-all cursor-pointer ${
+                      !dockedChatCollapsed 
+                        ? 'border-[var(--accent-color)] bg-[var(--accent-color)]/10 text-[var(--accent-color)] font-bold shadow-[0_0_8px_rgba(0,229,176,0.15)]' 
+                        : 'border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)]'
+                    }`}
+                    title="Toggle Live Lobby Chat inside Portal Arena"
                   >
-                    <ShieldAlert className="w-3.5 h-3.5 text-red-500 animate-pulse" />
-                    <span className="hidden sm:inline text-[10px] font-bold">PANIC ESCAPE ([ or ])</span>
+                    <MessageSquare className="w-3.5 h-3.5" />
                   </button>
+
+                  {/* Hide / Show Header Button */}
+                  <motion.button
+                    whileHover={animationsEnabled ? { scale: 1.03 } : undefined}
+                    whileTap={animationsEnabled ? { scale: 0.97 } : undefined}
+                    onClick={() => setGameHeaderHidden(!gameHeaderHidden)}
+                    className="flex items-center gap-1.5 border border-[var(--card-border)] hover:border-[var(--accent-color)] bg-[var(--bg-color)] text-[var(--text-primary)] hover:text-[var(--accent-color)] py-1.5 px-3 rounded-lg text-xs font-mono font-medium transition-all duration-200 cursor-pointer relative"
+                    title={gameHeaderHidden ? "Show Main Website Header" : "Hide Main Website Header"}
+                  >
+                    <motion.div
+                      animate={animationsEnabled ? (gameHeaderHidden ? { rotate: 180, scale: 1.05 } : { rotate: 0, scale: 1 }) : { rotate: 0, scale: 1 }}
+                      transition={animationsEnabled ? { type: "spring", stiffness: 200, damping: 15 } : { duration: 0 }}
+                      className="flex items-center justify-center"
+                    >
+                      {gameHeaderHidden ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
+                    </motion.div>
+                    <span className="hidden sm:inline text-[10px] font-bold tracking-tight">
+                      {gameHeaderHidden ? 'SHOW HEADER' : 'HIDE HEADER'}
+                    </span>
+                  </motion.button>
+
+
 
                 </div>
 
               </div>
+            )}
 
-              {/* Game Viewport Container */}
+              {/* Game Arena with Side-by-Side Docked Chat */}
               <div 
-                id="frame-viewport"
-                className="w-full h-[65vh] min-h-[420px] rounded-2xl border border-[var(--card-border)] bg-black overflow-hidden relative shadow-lg"
+                id="game-arena-container"
+                className="flex flex-col lg:flex-row gap-0 w-full relative flex-1 min-h-0 h-full overflow-hidden"
               >
+                {/* Game Viewport Container */}
                 <div 
-                  className="w-full h-full duration-150 transition-transform origin-top-left"
-                  style={{ 
-                    transform: `scale(${zoom})`,
-                    width: `${100 / zoom}%`,
-                    height: `${100 / zoom}%`
-                  }}
+                  id="frame-viewport"
+                  className="flex-1 w-full h-full rounded-none border-t border-[var(--card-border)] bg-black overflow-hidden relative flex flex-col min-h-0"
                 >
-                  <iframe 
-                    id="game-frame"
-                    src={selectedGame.url} 
-                    className="w-full h-full border-none"
-                    title={selectedGame.title}
-                    allowFullScreen
-                    referrerPolicy="no-referrer"
-                    sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
-                  />
+                  <div 
+                    className="w-full h-full duration-150 transition-transform origin-top-left flex-1 flex flex-col"
+                    style={{ 
+                      transform: `scale(${zoom})`,
+                      width: `${100 / zoom}%`,
+                      height: `${100 / zoom}%`
+                    }}
+                  >
+                    {gameFrame && (
+                      <iframe
+                        id="game-frame"
+                        key={selectedGame.id}
+                        {...gameFrame}
+                        className={`w-full h-full flex-1 border-none block m-0 p-0 ${isDraggingDock ? 'pointer-events-none select-none' : ''}`}
+                        title={selectedGame.title}
+                        allowFullScreen
+                        referrerPolicy="no-referrer"
+                        sandbox="allow-scripts allow-same-origin allow-popups allow-forms"
+                      />
+                    )}
+                  </div>
                 </div>
+
+                {/* DOCKED LIVE LOBBY CHAT */}
+                {!dockedChatCollapsed && (
+                  <div 
+                    style={{ width: window.innerWidth >= 1024 ? '235px' : '100%' }}
+                    className="w-full lg:h-full h-[320px] shrink-0 flex flex-col bg-[#070a11] border-t lg:border-t-0 lg:border-l border-[var(--card-border)]/50 rounded-none overflow-hidden"
+                  >
+                    <div className="flex-1 min-h-0">
+                      <UserChat onClose={() => {}} isMini={true} />
+                    </div>
+                  </div>
+                )}
               </div>
 
             </div>
@@ -2799,6 +5980,9 @@ if (iconUrl.includes('.ico')) {
         </main>
       </div>
 
-    </div>
+
+
+      </div>
+    </Suspense>
   );
 }

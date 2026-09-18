@@ -1,10 +1,14 @@
 export interface Game {
-  id: string;
+  id?: string;
   title: string;
   description: string;
   url: string;
   thumbnail: string;
   category: string;
+  featured?: boolean;
+  pointerLock?: boolean;
+  isAiGenerated?: boolean;
+  isOg?: boolean;
 }
 
 export interface Article {
